@@ -60,7 +60,7 @@ function describeBlocks(state: StateLike) {
 const HALF_SUMMARY_R = "REASONING-HALF SUMMARY ".repeat(30);
 const HALF_SUMMARY_C = "CALL-HALF SUMMARY ".repeat(30);
 
-test("#5186④ adjacent turn halves in ONE batch, reasoning half first — folds, but pins the nested-double-block wart", () => {
+test("#5186④ adjacent turn halves in ONE batch, reasoning half first — single merged block (nested-double-block wart fixed by kernel)", () => {
     const fx = buildFixture();
     const { R, A1, C, Res } = pushGapTurn(fx, 0);
     const refs = fx.refresh();
@@ -75,12 +75,14 @@ test("#5186④ adjacent turn halves in ONE batch, reasoning half first — folds
     console.error(`[shape adjacent R-first] ${describeBlocks(out.state)}`);
     assert.equal(out.result.errors.length, 0, `no apply-level fatal: ${out.result.errors.join(" | ")}`);
     assertCovered(out.state, [R, A1, C, Res]);
-    // Wart (stale pre-batch coverage): the call half should have been demoted to
-    // nothing-new-to-fold, but lands as a second ACTIVE block nested in the first.
+    // The nested-double-block wart (stale pre-batch coverage left the call half as a
+    // redundant ACTIVE block nested in the first) is FIXED on current master: the
+    // reasoning half now widens over the sibling and merges onto one block, exactly
+    // like the call-first and sequential lanes. Pin the single-block topology.
     const active = out.state.blocks.filter((b) => b.active);
-    assert.equal(active.length, 2, "current master leaves two active blocks");
-    const [outer, inner] = [...active].sort((a, b) => b.effectiveMessageIds.length - a.effectiveMessageIds.length);
-    for (const id of inner.effectiveMessageIds) assert.ok(outer.effectiveMessageIds.includes(id), "inner block must nest in outer");
+    assert.equal(active.length, 1, "reasoning-first batch merges onto one block (wart fixed)");
+    assert.deepEqual(active[0]!.effectiveMessageIds.slice().sort((a, b) => a.localeCompare(b, undefined, { numeric: true })),
+        ["msg-3", "msg-4", "msg-5", "msg-6"]);
 });
 
 test("#5186④ adjacent turn halves in ONE batch, call half first — single merged block", () => {
