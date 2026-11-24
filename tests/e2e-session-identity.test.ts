@@ -5,6 +5,7 @@ import path from "node:path";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import test, { after } from "node:test";
+import { recordToolUseId } from "../src/tool-ring.ts";
 
 process.env.NODE_ENV = "test";
 
@@ -81,16 +82,19 @@ interface MockUpstream {
     port: number;
     /** Headers of the most recent POST, lowercased — for passthrough assertions (#2779). */
     lastHeaders?: Record<string, string>;
+    lastBody?: Record<string, unknown>;
     close(): Promise<void>;
 }
 
 async function startMockUpstream(): Promise<MockUpstream> {
     let lastHeaders: Record<string, string> | undefined;
+    let lastBody: Record<string, unknown> | undefined;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             if (req.method === "POST") {
+                lastBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
                 lastHeaders = {};
                 for (const [k, v] of Object.entries(req.headers)) {
                     if (v !== undefined) lastHeaders[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : v;
@@ -116,6 +120,7 @@ async function startMockUpstream(): Promise<MockUpstream> {
         server,
         port,
         get lastHeaders() { return lastHeaders; },
+        get lastBody() { return lastBody; },
         close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
     };
 }
@@ -307,6 +312,59 @@ test("e2e session identity: openai prompt_cache_key survives bearer rotation (#2
         assert.equal(sessions[0]!.id, "pck-omp-1");
         assert.equal(sessions[0]!.protocol, "openai");
         assert.equal(sessions[0]!.requests, 2);
+    } finally {
+        await h.close();
+    }
+});
+
+test("native OMP Responses isolates parent and siblings sharing a provider cache key", async () => {
+    const h = await startHarness();
+    const parent = "omp-parent-affinity";
+    const children = ["omp-first-child", "omp-second-child"];
+    const headers = { "x-bili-host-recovery-owner": "omp", "session-id": parent };
+    try {
+        for (const id of [parent, ...children]) {
+            const registered = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/register`, {
+                method: "POST", headers: { "content-type": "application/json" },
+                body: JSON.stringify({ conversationId: id, agent: "omp", identity: true, ...(id !== parent ? { parentConversationId: parent } : {}) }),
+            });
+            assert.equal(registered.status, 200);
+            await registered.text();
+            if (id === parent) {
+                // Before any fork exists, a legacy root using only its PCK
+                // still records a model turn and can use its existing tools.
+                await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent }), { "x-bili-host-recovery-owner": "omp" });
+            } else if (id === children[1]) {
+                // An independently identified, registered legacy child may
+                // establish its own ledger on its very first request.
+                await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent, session_id: id }), { "x-bili-host-recovery-owner": "omp" });
+            }
+            await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent, biliJevHostSession: id }), headers);
+            const sent = h.upstreams[0]!.lastBody!;
+            assert.equal(sent.prompt_cache_key, parent);
+            assert.ok(!("biliJevHostSession" in sent));
+        }
+        // Both siblings share the key. An old header copied from the parent
+        // or conflicting child headers cannot choose either child.
+        await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent }), headers);
+        await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent, session_id: children[1] }), { ...headers, "session-id": children[0]! });
+        recordToolUseId("old-parent-call", parent);
+        const tool = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/tool`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: children[0], nativeCaller: true, toolCallId: "old-parent-call", tool: "compress", args: {} }),
+        });
+        assert.equal(tool.status, 409);
+        assert.equal((await tool.json() as { code: string }).code, "TOOL_CONVERSATION_CONFLICT");
+        const sessions = await getSessions(h);
+        assert.deepEqual(Object.fromEntries(sessions.map(s => [s.id, s.requests])), {
+            [parent]: 2, [children[0]!]: 1, [children[1]!]: 2,
+        });
+        for (const id of [parent, ...children]) {
+            const status = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=${encodeURIComponent(id)}`);
+            assert.equal(status.status, 200);
+            const state = await status.json() as { sessionId: string };
+            assert.equal(state.sessionId, id);
+        }
     } finally {
         await h.close();
     }

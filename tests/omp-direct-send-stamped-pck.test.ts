@@ -54,6 +54,18 @@ test("direct send keeps a prompt_cache_key the plugin did not stamp", async () =
     assert.equal(prep.outcome, "as-is");
 });
 
+test("direct Responses fallback preserves a child’s inherited provider key even after another turn synthesized that value", async () => {
+    const parent = "sess-direct-parent";
+    stampedBody(parent);
+    const ctx = { model: { baseUrl: "http://127.0.0.1:8199/v1" }, sessionManager: { getSessionId: () => "sess-direct-child" } };
+    const payload = { model: "m", input: "hello", prompt_cache_key: parent };
+    const body = withNativeClaim(() => stampPromptCacheKey({ payload }, ctx, "omp"));
+    const url = "https://provider.example/v1/responses";
+    const prep = await createOmpDirectSendGuard()(url, url, { method: "POST", body: JSON.stringify(body) });
+    assert.equal(prep.outcome, "restored");
+    if (prep.outcome === "restored") assert.deepEqual(JSON.parse(prep.body), payload);
+});
+
 test("direct send leaves a body without prompt_cache_key untouched", async () => {
     const plain = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] });
     const prep = await createOmpDirectSendGuard()(URL_MESSAGES, URL_MESSAGES, { method: "POST", body: plain });
