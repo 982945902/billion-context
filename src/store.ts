@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 import { log as loggerLog } from "./logger.js";
 import { stateDir } from "./paths.js";
 import { getStore } from "./persist.js";
+import { jevCcrActive, jevReplayPolicy } from "./jev-ccr.js";
 import type { CompressSettings } from "./config.js";
 import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
 import type { PendingRetrieval, Session } from "./session.js";
@@ -95,6 +96,9 @@ export function ccrLoopConfig(session: Session | undefined, config: KernelConfig
     if (!ccrEnabled(session)) return { ...config, ccr: undefined };
     const eff = effectiveCcr(session);
     if (!eff) return config;
+    if (jevCcrActive(session) && (session.meta.protocol === "openai" || session.metadata.jevCcrViews !== undefined)) {
+        return { ...config, ccr: { ...DEFAULT_CCR_CONFIG, ...eff, storePolicy: new Set(), replayPolicy: jevReplayPolicy(session) } };
+    }
     return { ...config, ccr: { ...DEFAULT_CCR_CONFIG, ...eff } };
 }
 

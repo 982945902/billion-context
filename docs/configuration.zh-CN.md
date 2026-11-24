@@ -1650,6 +1650,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 
 #### `ccr`
 
+**OMP Chat Completions 的 Jev 裁剪试验。** 开启全局 `compress.ccr.enabled`，并在试验 OMP 客户端和代理环境中设置 `BILI_JEV_CCR=1`。在客户端的 Jev harness 配置中设置 `trim: false`，使 bili 收到完整工具输出。代理默认从 `~/.pi/agent/jev-harness.json` 读取 `baseUrl`（含 `/v1/systemone` 的完整地址）、`apiKey` 和 `model`。可用 `BILI_JEV_CONFIG` 指定同格式的独立 JSON 文件，用 `BILI_JEV_API_KEY` 覆盖文件里的密钥。缺省地址和模型为 `http://127.0.0.1:3425/v1/systemone` 和 `group/jev`。每批最多 12 项，发送当前任务及限长摘录，网络判断预算 1.2 秒。失败或不确定时保留全文。
+
 - **类型：** `object`（`{ enabled?, minToolTokens?, excludeTools?, toolName?, maxHeadChars? }`）
 - **默认值：** *（全车道默认关闭（#1207 决策）— 未设置时保持关闭；在任意层级显式设置 `enabled: true` 方可启用（建议先本地验证）。插件通道同样需全局 `enabled: true` 才武装（#1271/#1273））*
 - **状态：** ACTIVE（v2 — 全车道 opt-in；插件通道限 anthropic + openai wire，显式开启后生效）

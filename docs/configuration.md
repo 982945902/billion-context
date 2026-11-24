@@ -1665,6 +1665,8 @@ Optional surface blocks: `prompts` (inline rule-text overrides), `nudgeSections`
 
 #### `ccr`
 
+**Experimental Jev policy for OMP Chat Completions.** Enable global `compress.ccr.enabled` and set `BILI_JEV_CCR=1` for the trial OMP client and proxy. Set `trim: false` in the trial client's Jev harness settings so bili receives the original output. The proxy reads the System One endpoint (`baseUrl`, including `/v1/systemone`), bearer credential (`apiKey`), and `model` from `~/.pi/agent/jev-harness.json`. Set `BILI_JEV_CONFIG` to use a separate JSON file with the same fields. `BILI_JEV_API_KEY` overrides the file credential. The default endpoint and model are `http://127.0.0.1:3425/v1/systemone` and `group/jev`. Each request includes the current task and bounded samples from up to 12 candidates, with a 1.2-second network deadline. Errors and uncertain judgments keep the original.
+
 - **Type:** `object` (`{ enabled?, minToolTokens?, excludeTools?, toolName?, maxHeadChars? }`)
 - **Default:** *(on in proxy mode since v2 (#1179) — unset resolves to `enabled: true`; an explicit `enabled: false` at any level opts out. Plugin lanes stay opt-in: they arm only on an explicit global `enabled: true`, #1271/#1273.)*
 - **Status:** ACTIVE (v2 — proxy mode by default; plugin mode on the anthropic + openai wires when explicitly enabled)

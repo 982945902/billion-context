@@ -17,9 +17,9 @@ import { scrubLoneSurrogates } from "./truncate.js";
 import { hideConsumedCompressCalls, refNum } from "./hide-consumed.js";
 import { appendAbsorbPrompts, hideAbsorbedMessages } from "./absorb.js";
 import { applyCrushToMessages } from "./crush.js";
-import { applyRetrieve, ccrStoreNode, RETRIEVED_ID_PREFIX } from "./ccr.js";
+import { applyRetrieve, ccrStoreNode, collectNewCcrResults, RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { preTransformSnapshotNode, viewLatchNode } from "./view-latch.js";
-import type { ApplyRetrieveResult, CcrEffect } from "./ccr.js";
+import type { ApplyRetrieveResult, CcrCandidate, CcrEffect, StoreLargeResultsInput } from "./ccr.js";
 import type { EmergencyTruncateLatchEntry } from "./types.js";
 import { createContentStore } from "./content-store.js";
 import type { MessageContentStore } from "./content-store.js";
@@ -1138,9 +1138,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
     const base: PipelineNode[] = [
       reconcileLiveIdsNode,
       createStampTimestampsNode(timestampsOn),
-      assignRefsNode,
-      syncBlocksNode,
-      pruneNode,
+      ...ccrInputNodes,
       preTransformSnapshotNode,
       ccrStoreNode,
       absorbHideNode,
@@ -1365,6 +1363,24 @@ const pruneNode: PipelineNode = {
     };
   },
 };
+
+const ccrInputNodes = [assignRefsNode, syncBlocksNode, pruneNode];
+
+/** Collect fresh, eligible tool results without committing state. Pass the
+ *  pre-turn state: a known raw ID was already shown and cannot be a first
+ *  arrival. Authorize selected candidate IDs in config.ccr.storePolicy. */
+export function collectCcrCandidates(input: StoreLargeResultsInput): CcrCandidate[] {
+  if (!input.config.ccr?.enabled) return [];
+  const view = runPipeline(
+    [reconcileLiveIdsNode, ...ccrInputNodes],
+    { messages: input.messages, state: input.state, effects: {} },
+    { config: input.config, countTokens: input.countTokens, contentStore: input.store, tokenCount: 0 },
+  );
+  return collectNewCcrResults(
+    { ...input, messages: view.messages, state: view.state },
+    input.state.messageRefs,
+  );
+}
 
 const absorbHideNode: PipelineNode = {
   name: "absorb-hide",

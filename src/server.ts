@@ -3144,7 +3144,8 @@ export function scrubMsgIdFields(bodyBuffer: Buffer, log: (level: string, msg: s
     const p = parsed as Record<string, unknown>;
     const hasIds = Object.prototype.hasOwnProperty.call(p, MSG_IDS_BODY_FIELD);
     const hasSeqs = Object.prototype.hasOwnProperty.call(p, MSG_SEQS_BODY_FIELD);
-    if (!hasIds && !hasSeqs) return bodyBuffer;
+    if (!hasIds && !hasSeqs && !("biliJevHostSession" in p)) return bodyBuffer;
+    delete p.biliJevHostSession;
     if (hasIds) delete p[MSG_IDS_BODY_FIELD];
     if (hasSeqs) delete p[MSG_SEQS_BODY_FIELD];
     log("debug", "stripped biliMsgIds/biliLedgerSeqs from verbatim forward (#6539)");

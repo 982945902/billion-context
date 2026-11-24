@@ -527,11 +527,15 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
     const p = payload as Record<string, unknown>;
     if (!Array.isArray(p.messages)) return undefined;
     if (p.input !== undefined) return undefined;
-    if (typeof p.prompt_cache_key === "string" && p.prompt_cache_key.trim().length > 0) return undefined;
+    const hostKey = typeof p.prompt_cache_key === "string" && p.prompt_cache_key.trim().length > 0;
+    const jev = process.env.BILI_JEV_CCR === "1" && ctx.model?.api === "openai-completions";
+    if (hostKey && !jev) return undefined;
     const sid = sessionIdOf(ctx);
-    if (sid === undefined || sid.length === 0) return undefined;
-    rememberStampedPromptCacheKey(sid);
-    return { ...p, prompt_cache_key: sid };
+    if (!sid) return undefined;
+    if (!hostKey) rememberStampedPromptCacheKey(sid);
+    // A fork may inherit the parent's provider cache key. Carry the actual
+    // owner separately so the proxy can prove where acp_retrieve will run.
+    return { ...p, ...(!hostKey ? { prompt_cache_key: sid } : {}), ...(jev ? { biliJevHostSession: sid } : {}) };
 }
 
 // #6525: single source of truth for "the proxy will see this request's
@@ -678,9 +682,12 @@ function withoutStampedPromptCacheKey(text: string): string | undefined {
         return undefined;
     }
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-    const { prompt_cache_key: key, ...rest } = parsed as Record<string, unknown>;
-    if (typeof key !== "string" || !stampedPromptCacheKeys.has(key)) return undefined;
-    return JSON.stringify(rest);
+    const body = parsed as Record<string, unknown>;
+    const stampedKey = typeof body.prompt_cache_key === "string" && stampedPromptCacheKeys.has(body.prompt_cache_key);
+    if (!stampedKey && !("biliJevHostSession" in body)) return undefined;
+    if (stampedKey) delete body.prompt_cache_key;
+    delete body.biliJevHostSession;
+    return JSON.stringify(body);
 }
 
 function fmtTok(n: number): string {

@@ -124,6 +124,8 @@ billion-context/
 │   │   ├── status-body.ts        #   Inbound acp_status report-body stripping (#2789)
 │   ├── chain-checkpoint.ts       # Chain-checkpoint digest match / stale verdict split (#1421)
 │   ├── store.ts                  # Content retrieval store (CCR) + per-request policy stamping
+│   ├── jev-ccr.ts                # OMP first-view decisions and verification of persisted originals
+│   ├── jev-judge.ts              # Batch CCR decisions via the configured System One endpoint
 │   ├── rules-feature.ts          # Model-owned session rules opt-in (#1399)
 │   ├── system-anchor.ts          # Stable system anchor fingerprint (volatile-head guard)
 │   ├── subagent-sessions.ts      # opencode sub-agent dispatch session keying (#1702)

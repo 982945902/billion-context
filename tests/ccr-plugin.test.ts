@@ -717,3 +717,93 @@ test("e2e #1457 anthropic plugin lane: same atomic delivery — failure passes t
         await closeRig(rig);
     }
 });
+
+test("OMP Jev CCR batches first views, gates shared cache keys, and reloads exact child originals", async (t) => {
+    const dir = mkdtempSync(path.join(process.env.TMPDIR ?? ".", "bili-jev-ccr-"));
+    const rig = await startRig();
+    const batches: Array<{ task: string; outputs: unknown[] }> = [];
+    const judge = http.createServer(async (req, res) => {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        batches.push(JSON.parse(body).state);
+        res.end(JSON.stringify({ answers: { result_0: { type: "choice", choice: "store", confidence: 1 } } }));
+    });
+    judge.listen(0, "127.0.0.1");
+    await once(judge, "listening");
+    const configPath = path.join(dir, "judge.json");
+    const judgeAddress = judge.address();
+    assert.ok(judgeAddress && typeof judgeAddress === "object");
+    writeFileSync(configPath, JSON.stringify({ baseUrl: `http://127.0.0.1:${judgeAddress.port}`, apiKey: "test" }));
+    const env = { BILI_JEV_CCR: process.env.BILI_JEV_CCR, BILI_JEV_CONFIG: process.env.BILI_JEV_CONFIG, XDG_STATE_HOME: process.env.XDG_STATE_HOME };
+    process.env.XDG_STATE_HOME = dir;
+    process.env.BILI_JEV_CCR = "1";
+    process.env.BILI_JEV_CONFIG = configPath;
+    const openStore = () => new SessionStore({ enabled: true, dir, debounceMs: 10 });
+    let storage = openStore();
+    _setStoreForTest(storage);
+    const text = `${BIG_TEXT}\r\nUNIQUE CHILD LINE\r\n${BIG_TEXT}`;
+    const parent = "omp-jev-parent";
+    const child = "omp-jev-child";
+    const messages = [
+        ...BASE_MSGS(),
+        { role: "user", content: "check both child outputs" },
+        { role: "assistant", tool_calls: ["a", "b"].map(id => ({ id, type: "function", function: { name: "bash", arguments: JSON.stringify({ command: id }) } })) },
+        { role: "tool", tool_call_id: "a", content: text },
+        { role: "tool", tool_call_id: "b", content: `FAILED ${BIG_TEXT}` },
+    ];
+    const send = async (id: string, host?: string) => {
+        const res = await fetch(`http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`, {
+            method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "omp", "x-bili-plugin-conversation": id, "x-session-id": id },
+            body: JSON.stringify({ model: MODEL, max_tokens: 8192, prompt_cache_key: parent, biliJevHostSession: host, messages }),
+        });
+        assert.equal(res.status, 200, await res.text());
+        const wire = JSON.parse(rig.forwards.at(-1)!);
+        assert.ok(!("biliJevHostSession" in wire));
+        return wire.messages.filter((m: { role: string }) => m.role === "tool").map((m: { content: string }) => m.content) as string[];
+    };
+    try {
+        for (const host of [undefined, child]) {
+            const raw = await send(parent, host);
+            assert.equal(raw[1], text);
+            assert.equal(batches.length, 0);
+        }
+        const first = await send(child, child);
+        assert.ok(first[0]!.includes(BIG_TEXT), "a previous user turn stays raw");
+        const ref = /\[acp-stored #(m\d+)/.exec(first[1]!)?.[1];
+        assert.ok(ref, first[1]?.slice(0, 100));
+        assert.ok(first[2]!.includes(`FAILED ${BIG_TEXT}`));
+        assert.equal(batches.length, 1);
+        assert.equal(batches[0]!.task, "check both child outputs");
+        assert.equal(batches[0]!.outputs.length, 2);
+        await storage.flushAll(listSessions());
+        _resetSessionsForTest();
+        storage = openStore();
+        _setStoreForTest(storage);
+        assert.deepEqual(await send(child, child), first);
+        assert.equal(batches.length, 1, "resumed full and stored outputs both replay without a judgment");
+        const retrieved = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: child, nativeCaller: true, tool: "acp_retrieve", args: { ref } }),
+        });
+        const receipt = await retrieved.json() as { result?: string; retrievalExport?: { text?: string } };
+        assert.equal(retrieved.status, 200);
+        assert.ok(receipt.result?.includes(text) || receipt.retrievalExport?.text === text);
+        const fail = t.mock.method(storage, "flushSessionNow", async () => ({ ok: false, epoch: undefined }));
+        const failed = await send("omp-jev-failed-save", "omp-jev-failed-save");
+        assert.ok(failed[1]!.includes(text));
+        fail.mock.restore();
+        assert.deepEqual(await send("omp-jev-failed-save", "omp-jev-failed-save"), failed);
+        assert.equal(batches.length, 2, "failed persistence commits a sticky full view");
+    } finally {
+        await closeRig(rig);
+        judge.close();
+        judge.closeAllConnections();
+        await storage.flushAll(listSessions());
+        _resetSessionsForTest();
+        for (const [name, value] of Object.entries(env)) {
+            if (value === undefined) delete process.env[name];
+            else process.env[name] = value;
+        }
+        rmrf(dir);
+    }
+});

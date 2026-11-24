@@ -1,7 +1,6 @@
 import { BLOCKED_REF } from "./refs.js";
-import { RETRIEVED_ID_PREFIX } from "./ccr.js";
+import { parseStoredPlaceholder, resolveCcrConfig, RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { resolveAbsorbConfig } from "./absorb.js";
-import { resolveCcrConfig } from "./ccr.js";
 import { resolveCrushConfig } from "./crush.js";
 import type { CompressionState, CoreMessage, ViewLatchEntry } from "./types.js";
 import type { NodeIO, PipelineNode, PipelineContext } from "./pipeline.js";
@@ -52,6 +51,10 @@ function latchKeyEqual(
  *  instead of waiting for a fold. tokenCount is deliberately NOT included
  *  (pressure fluctuation is what the latch exists to gate). */
 export function viewLatchConfigDigest(ctx: PipelineContext): string {
+  // Per-turn authorization changes leave unrelated latches intact.
+  const ccr = resolveCcrConfig(ctx.config);
+  delete ccr.storePolicy;
+  delete ccr.replayPolicy;
   return JSON.stringify({
     absorb: resolveAbsorbConfig(ctx.config),
     crush: resolveCrushConfig(ctx.config),
@@ -60,7 +63,7 @@ export function viewLatchConfigDigest(ctx: PipelineContext): string {
     // channel they advertise would be gone (dangling placeholder = silent
     // loss, the #1273 plugin-governance contract). A digest change releases
     // the latch and re-judges every message under the CURRENT config.
-    ccr: resolveCcrConfig(ctx.config),
+    ccr,
     filters: {
       enabled: ctx.config.messageFilters?.enabled ?? false,
       filters: ctx.config.messageFilters?.filters ?? null,
@@ -98,7 +101,19 @@ export function applyViewLatch(io: NodeIO, ctx?: PipelineContext): NodeIO {
       continue;
     }
     const transformed = post.get(m.id);
-    const prevEntry = prev?.[ref];
+    let prevEntry = prev?.[ref];
+    // A persisted latch cannot vouch for the availability of an archive.
+    // With host-verified replay, let the CCR pass govern placeholder bytes
+    // whenever current and latched views disagree about that ref.
+    if (
+      ctx?.config.ccr?.replayPolicy !== undefined && prevEntry &&
+      m.contentType === "tool-result" && prevEntry.text !== transformed?.text &&
+      ((prevEntry.text && parseStoredPlaceholder(prevEntry.text)?.ref === ref) ||
+        (transformed?.text && transformed.text !== m.text &&
+          parseStoredPlaceholder(transformed.text)?.ref === ref))
+    ) {
+      prevEntry = undefined;
+    }
     if (prevEntry) {
       // REPLAY the latched bytes — a transform's fresh output for an
       // already-latched ref is deferred to the next fold boundary.

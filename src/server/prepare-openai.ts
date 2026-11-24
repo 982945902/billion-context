@@ -32,6 +32,7 @@ import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { buildBlockOpsSystemPrompt } from "acp-kernel";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
+import { confirmJevCcr, jevCcrActive, planJevCcr } from "../jev-ccr.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -134,6 +135,8 @@ export async function prepareOpenai(
     const incomingSeqsRaw = incomingSeqsOf(parsed);
     delete parsed[MSG_SEQS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as Record<string, unknown>).biliJevHostSession;
+    const jev = pluginMode && ccrEnabled(session) && jevCcrActive(session);
     // #7064 §8: the INCREMENTAL pin reuses the watermark's bounded tail-ids
     // header — the same bytes that ride the wire for the hit verdict pin the
     // prefix when the full list is absent. Three-state handoff to stage 0
@@ -223,7 +226,7 @@ export async function prepareOpenai(
     let wpOutcome: FastpathOutcome | null = null;
     let wpFullText: string | undefined;
     const wpModel = typeof parsed.model === "string" ? parsed.model : "";
-    if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
+    if (!jev && bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
         wpFullText = bodyText;
         // Delta arm first: a delta claim is EXCLUSIVE — the body carries only
         // the tail slice, so the full-body lane cannot evaluate it at all. A
@@ -364,7 +367,7 @@ export async function prepareOpenai(
         // Bootstrap: an armed turn with an EMPTY flow is the turn-1 cold start
         // the ruling allows — the client bytes enter the flow exactly once
         // (the record below), from turn 2 the log is the content source.
-        egressArmed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: isTitleGen });
+        egressArmed = !jev && egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: isTitleGen });
         if (egressArmed) {
             // The single shared authority seam (egress-lane-io): latch,
             // recover, hard-fail, bootstrap / swap / legacy — one code path
@@ -390,7 +393,7 @@ export async function prepareOpenai(
         // re-mints #3752); only the live tail keeps the client's bytes.
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        const renderMsgs = jev ? msgs : maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
 
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
@@ -513,7 +516,12 @@ export async function prepareOpenai(
         // nudge-carrying request rolls the cadence back to pre-turn (lane
         // mirror of the anthropic-lane fix).
         nudgeStampsBefore = nudgeStampsOf(session);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        const inputStore = contentStoreOf(session);
+        const inputState = session.state;
+        const jevPlan = jev ? await planJevCcr(session, renderMsgs, loopConfig, inputStore) : undefined;
+        const previousStoreStats = jevPlan?.storeIds.size ? { storedBytes: session.stats.storedBytes, storeBytesSaved: session.stats.storeBytesSaved } : undefined;
+        const turnInput = { messages: renderMsgs, state: inputState, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: inputStore } as const;
+        let turn = core.processTurn(jevPlan && loopConfig.ccr ? { ...turnInput, config: { ...loopConfig, ccr: { ...loopConfig.ccr, storePolicy: jevPlan.storeIds, replayPolicy: jevPlan.replayIds } } } : turnInput);
         session.state = turn.state;
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
@@ -559,6 +567,19 @@ export async function prepareOpenai(
         // (persist tail selection, ingest tail_json, handoff stash, export).
         if (wpHit !== undefined) session.lastMessagesFolded = true;
         snapFlush = await SessionStore.flushOrSkip(session);
+        if (jevPlan && !confirmJevCcr(session, jevPlan, snapFlush.ok)) {
+            // The trial view and its latch have never left the proxy. Restore
+            // the previous originals and render from the pre-turn state so
+            // every later pass sees the same full-text decision.
+            session.contentStore = inputStore;
+            session.contentStoreDirty = true;
+            if (previousStoreStats) Object.assign(session.stats, previousStoreStats);
+            turn = core.processTurn({ ...turnInput, config: ccrLoopConfig(session, loopConfig) });
+            session.state = turn.state;
+            if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
+            snapFlush = await SessionStore.flushOrSkip(session);
+            log("warn", `[${sessionId}] Jev CCR original or decision could not be verified on disk; forwarded full tool results`);
+        }
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -695,7 +716,7 @@ export async function prepareOpenai(
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         if (blockOpsActive) sysParts.push(buildBlockOpsSystemPrompt("function"));
         openaiOutboundSystem = sysParts.join("\n\n");
-        if (!isTitleGen && featureEnabled("egressPlane") && !(egressArmed && !egressSwapApplied)) {
+        if (!jev && !isTitleGen && featureEnabled("egressPlane") && !(egressArmed && !egressSwapApplied)) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 try {
@@ -953,7 +974,7 @@ export async function prepareOpenai(
     // empty flow records the client view ONCE — that is the cold start, not
     // "untrusted bytes advancing the flow" (there is no flow to advance
     // against; from turn 2 the armed gate is fully enforced again).
-    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog && !(egressArmed && !egressSwapApplied && !egressBootstrap)) {
+    if (!jev && !isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog && !(egressArmed && !egressSwapApplied && !egressBootstrap)) {
         try {
             const st = getStore().egressOpLogStore();
             if (st) {
@@ -981,7 +1002,7 @@ export async function prepareOpenai(
     // identity rate the swap will rely on (rollout egressPlane, default 0;
     // reads the hydrated flow view — on a bootstrap turn that is the view
     // the record above just wrote, i.e. an exact self-compare).
-    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog) {
+    if (!jev && !isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog) {
         try {
             const st = getStore().egressOpLogStore();
             const view = egressBaseRows ?? (st ? st.egressStateView(sessionId) : undefined);

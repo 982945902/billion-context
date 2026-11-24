@@ -76,7 +76,7 @@ import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
 import { MSG_IDS_BODY_FIELD, MSGID_MODE_HEADER, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
-import { DeltaReanchorError } from "./fastpath.js";
+import { DeltaReanchorError, PF_DELTA_HEADER } from "./fastpath.js";
 import { synthesizeTopLevel } from "./fastpath-scan.js";
 import { harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
@@ -2159,6 +2159,21 @@ async function handleRequest(
         }
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
+        const jevHost = (parsed as Record<string, unknown>).biliJevHostSession;
+        const jevRequest = protocol === "openai" && process.env.BILI_JEV_CCR === "1" && opts.compress.ccr?.enabled === true
+            && (pluginAgent === "omp" || jevHost !== undefined);
+        if (jevRequest && req.headers[PF_DELTA_HEADER] !== undefined) {
+            res.writeHead(400, { "content-type": "application/json", [MSGID_MODE_HEADER]: "full" });
+            res.end(JSON.stringify({ error: { type: "pf_delta_reanchor", message: "Jev CCR needs the complete tool-result history" } }));
+            return;
+        }
+        if (jevRequest && (pluginAgent !== "omp" || jevHost !== session.id || pluginConversation !== session.id)) {
+            // PCK and plugin headers can both be inherited from a fork parent.
+            // A mismatched request must not read, register, or write its refs.
+            const raw = scrubMsgIdFields(scrubCompatDrop(bodyBuffer, compatDropPaths, log), log);
+            await forward(req, res, opts, raw, null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
+            return;
+        }
         // #4649: remember this request's client UA in the bounded registry so a
         // diagnostics report carries the client's own version (non-dsh lanes
         // have no profile bundle to read it from). Runs for EVERY model
@@ -2523,7 +2538,7 @@ async function handleRequest(
         // header or session_id.
         if (zcodeMemory === undefined && (protocol === "responses" || protocol === "openai" || protocol === "anthropic")) {
             const pck = (parsed as { prompt_cache_key?: unknown }).prompt_cache_key;
-            if (typeof pck === "string" && pck.trim().length > 0) {
+            if (typeof pck === "string" && pck.trim().length > 0 && (!jevRequest || pck.trim() === jevHost)) {
                 recordPluginSession(pck.trim(), session.id);
             }
         }
