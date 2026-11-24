@@ -2160,7 +2160,7 @@ async function handleRequest(
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
         const jevHost = (parsed as Record<string, unknown>).biliJevHostSession;
-        const jevTrial = process.env.BILI_JEV_CCR === "1";
+        const jevTrial = opts.compress.ccr?.jevTrial === true || process.env.BILI_JEV_CCR === "1";
         const jevRequest = jevTrial && protocol === "openai" && opts.compress.ccr?.enabled === true && jevHost !== undefined;
         if (jevRequest && req.headers[PF_DELTA_HEADER] !== undefined) {
             res.writeHead(400, { "content-type": "application/json", [MSGID_MODE_HEADER]: "full" });

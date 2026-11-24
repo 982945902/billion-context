@@ -586,6 +586,8 @@ export type CompressSettings = {
     ccr?: {
         /** Enable CCR for this scope. Absent/false = off (kernel semantics). */
         enabled?: boolean;
+        /** Restrict storage on this shared listener to explicitly marked OMP Jev trial requests. */
+        jevTrial?: boolean;
         /** Tool results smaller than this many tokens stay verbatim
          *  (kernel default 4000). */
         minToolTokens?: number;
@@ -3508,12 +3510,12 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         } else {
             const co = c as Record<string, unknown>;
             const cleaned: NonNullable<CompressSettings["ccr"]> = {};
-            for (const key of ["enabled", "minToolTokens", "excludeTools", "toolName", "maxHeadChars"] as const) {
+            for (const key of ["enabled", "jevTrial", "minToolTokens", "excludeTools", "toolName", "maxHeadChars"] as const) {
                 if (!(key in co)) continue;
                 const v = co[key];
-                if (key === "enabled") {
+                if (key === "enabled" || key === "jevTrial") {
                     if (typeof v !== "boolean") { ok = false; continue; }
-                    cleaned.enabled = v;
+                    cleaned[key] = v;
                 } else if (key === "minToolTokens" || key === "maxHeadChars") {
                     if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
                     cleaned[key] = v;

@@ -10,7 +10,8 @@ const noIds = new Set<string>();
 const verified = new WeakMap<Session, ReadonlySet<string>>();
 
 export function jevCcrActive(session: Session | undefined): session is Session {
-    return process.env.BILI_JEV_CCR === "1" && session?.metadata.pluginAgent === "omp";
+    const policy = session?.metadata.effectiveCcr as { jevTrial?: boolean } | null | undefined;
+    return session?.metadata.pluginAgent === "omp" && (policy?.jevTrial === true || process.env.BILI_JEV_CCR === "1");
 }
 
 export function jevReplayPolicy(session: Session): ReadonlySet<string> {
