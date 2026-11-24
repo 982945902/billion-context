@@ -130,7 +130,8 @@ test("non-omp agents are never stamped", () => {
 test("an existing prompt_cache_key is never overwritten", () => {
     withIntercept(true, () => withEnv(PROXY_ORIGIN, () => {
         const out = stampPromptCacheKey(makeEvent({ prompt_cache_key: "user-set" }), makeCtx("http://10.0.0.8:8199/v1"), "omp");
-        assert.equal(out, undefined);
+        assert.equal(out?.prompt_cache_key, "user-set");
+        assert.equal(out?.biliJevHostSession, "sess-1579");
     }));
 });
 

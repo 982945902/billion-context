@@ -14,12 +14,14 @@ const INTERCEPT_FLAG = Symbol.for("billion-context.native-fetch-intercept");
 const PROXY_ORIGIN = "http://127.0.0.1:36011";
 const URL_MESSAGES = "http://127.0.0.1:8199/v1/messages";
 
-function withNativeClaim<T>(fn: () => T): T {
+function withNativeClaim<T>(fn: () => T, jevTrial = false): T {
     const g = globalThis as Record<PropertyKey, unknown>;
     const prevFlag = g[INTERCEPT_FLAG];
     const prevProxy = process.env.BILLION_CONTEXT_PROXY;
+    const prevJev = process.env.BILI_JEV_CCR;
     g[INTERCEPT_FLAG] = true;
     process.env.BILLION_CONTEXT_PROXY = PROXY_ORIGIN;
+    process.env.BILI_JEV_CCR = jevTrial ? "1" : "0";
     try {
         return fn();
     } finally {
@@ -27,6 +29,8 @@ function withNativeClaim<T>(fn: () => T): T {
         else g[INTERCEPT_FLAG] = prevFlag;
         if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = prevProxy;
+        if (prevJev === undefined) delete process.env.BILI_JEV_CCR;
+        else process.env.BILI_JEV_CCR = prevJev;
     }
 }
 
@@ -57,11 +61,27 @@ test("direct send keeps a prompt_cache_key the plugin did not stamp", async () =
 test("direct Responses strips request-private fields but preserves a provider key also used by Chat", async () => {
     stampedBody("overlapping-provider-key");
     const plain = { input: [{ role: "user", content: "biliJevHostSession is ordinary message text" }], prompt_cache_key: "overlapping-provider-key" };
-    const body = { ...plain, biliJevHostSession: "actual-child", biliMsgIds: ["m1"], biliLedgerSeqs: [1] };
-    const url = "http://127.0.0.1:8199/v1/responses";
+    const ctx = { model: { api: "openai-responses", baseUrl: "http://127.0.0.1:8199/relay" }, sessionManager: { getSessionId: () => "actual-child" } };
+    const stamped = withNativeClaim(() => stampPromptCacheKey({ payload: plain }, ctx, "omp"), true);
+    assert.deepEqual(stamped, { ...plain, biliJevHostSession: "actual-child" });
+    const body = { ...stamped, biliMsgIds: ["m1"], biliLedgerSeqs: [1] };
+    const url = `${ctx.model.baseUrl}/responses`;
     const prep = await createOmpDirectSendGuard()(url, new Request(url, { method: "POST", body: JSON.stringify(body) }), undefined);
     assert.equal(prep.outcome, "restored");
     if (prep.outcome === "restored") assert.deepEqual(JSON.parse(prep.body), plain);
+});
+
+test("direct Responses fallback preserves a child’s inherited provider key even after another turn synthesized that value", async () => {
+    const parent = "sess-direct-parent";
+    stampedBody(parent);
+    const ctx = { model: { api: "openai-responses", baseUrl: "http://127.0.0.1:8199/v1" }, sessionManager: { getSessionId: () => "sess-direct-child" } };
+    const payload = { model: "m", input: "hello", prompt_cache_key: parent };
+    const body = withNativeClaim(() => stampPromptCacheKey({ payload }, ctx, "omp"));
+    assert.deepEqual(body, { ...payload, biliJevHostSession: "sess-direct-child", biliJevCcr: false });
+    const url = `${ctx.model.baseUrl}/responses`;
+    const prep = await createOmpDirectSendGuard()(url, url, { method: "POST", body: JSON.stringify(body) });
+    assert.equal(prep.outcome, "restored");
+    if (prep.outcome === "restored") assert.deepEqual(JSON.parse(prep.body), payload);
 });
 
 test("direct send leaves a body without prompt_cache_key untouched", async () => {

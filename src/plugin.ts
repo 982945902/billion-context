@@ -977,6 +977,16 @@ export function takePendingPluginRegister(
 }
 const registeredIds = new Map<string, { agent: string; parentConversationId?: string }>();
 
+/** A legacy model turn keyed only by this OMP parent could belong to any
+ *  registered child. Its registration identifies lineage, never the sender. */
+export function hasRegisteredOmpChild(parent: unknown): boolean {
+    if (typeof parent !== "string" || !parent) return false;
+    for (const registration of registeredIds.values()) {
+        if (registration.agent === "omp" && registration.parentConversationId === parent) return true;
+    }
+    return false;
+}
+
 /** Identity-driven binding (#162): hosts whose model requests carry the SAME
  *  id the MCP shell registered (claude code: every request has
  *  x-claude-code-session-id === CLAUDE_CODE_SESSION_ID === the registered
@@ -1224,6 +1234,10 @@ function conversationIdForSession(sessionId: string): string | undefined {
  *  on lookup; unknown ids still create no session. */
 export function resolveConversation(conversationId: string): { session: Session | undefined; entry?: ConversationEntry } {
     let entry = conversations.get(conversationId);
+    if (registeredIds.get(conversationId)?.agent === "omp") {
+        const session = peekSession(conversationId);
+        return { session, entry: entry?.sessionId === conversationId ? entry : undefined };
+    }
     let session = peekSession(conversationId) ?? (entry ? peekSession(entry.sessionId) : undefined);
     if (!session) {
         session = findSessionByCanonicalId(conversationId);
@@ -1579,6 +1593,7 @@ export function forkParentRevisionLegacy(session: Session): string {
 async function resolveForkConversation(id: string): Promise<Session | undefined> {
     if (peekSession(id)) return peekSession(id);
     if (await getStore().loadAsync(id)) return getSessionAsync(id);
+    if (registeredIds.get(id)?.agent === "omp") return undefined;
     const { session, entry } = resolveConversation(id);
     if (session) return session;
     const persistedId = entry?.sessionId ?? id;
@@ -2490,6 +2505,13 @@ export async function handlePluginTool(
     if (!session) {
         session = await resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
+    }
+    // A legacy OMP child may present a call id witnessed under the parent's
+    // shared cache key. Neither that witness nor a stale alias authorizes
+    // the child to read or modify the other session's refs.
+    if (nativeCaller && conversationId && session && session.id !== conversationId
+        && (registeredIds.get(conversationId)?.agent === "omp" || session.metadata.pluginAgent === "omp")) {
+        return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "OMP tool call resolves outside its host session; send a model turn under the child session first", conversationId });
     }
     // #760: the verbatim-id fallback above can resolve a session with NO map
     // entry (first call), so only the session itself gates execution.

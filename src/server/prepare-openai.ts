@@ -118,6 +118,7 @@ export async function prepareOpenai(
     decide?: DecideConfig,
     bodyText?: string,
     bodyParseDeferred = false,
+    ompProviderKey = false,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -869,7 +870,8 @@ export async function prepareOpenai(
     // A/B seam as the rejection backstop; disabled never emits a bili-owned
     // key but still forwards genuine client keys verbatim (and still honors
     // an A/B ablation against them).
-    const pckDecision = resolveRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, effectivePromptCacheRouting(opts.promptCache), session.id, modelIdOf(parsed));
+    const identityHeader = ompProviderKey ? undefined : conversationHeaderSource(req.headers)?.name;
+    const pckDecision = resolveRelayAffinityPck(identityHeader, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, effectivePromptCacheRouting(opts.promptCache), session.id, modelIdOf(parsed));
     if (pckDecision === "stamp") {
         rebuilt.prompt_cache_key = session.id;
     } else if (pckDecision === "drop") {

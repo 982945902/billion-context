@@ -5,6 +5,7 @@ import path from "node:path";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import test, { after } from "node:test";
+import { recordToolUseId } from "../src/tool-ring.ts";
 
 process.env.NODE_ENV = "test";
 
@@ -319,6 +320,59 @@ test("e2e session identity: openai prompt_cache_key survives bearer rotation (#2
     }
 });
 
+test("native OMP Responses isolates parent and siblings sharing a provider cache key", async () => {
+    const h = await startHarness();
+    const parent = "omp-parent-affinity";
+    const children = ["omp-first-child", "omp-second-child"];
+    const headers = { "x-bili-host-recovery-owner": "omp", "session-id": parent };
+    try {
+        for (const id of [parent, ...children]) {
+            const registered = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/register`, {
+                method: "POST", headers: { "content-type": "application/json" },
+                body: JSON.stringify({ conversationId: id, agent: "omp", identity: true, ...(id !== parent ? { parentConversationId: parent } : {}) }),
+            });
+            assert.equal(registered.status, 200);
+            await registered.text();
+            if (id === parent) {
+                // Before any fork exists, a legacy root using only its PCK
+                // still records a model turn and can use its existing tools.
+                await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent }), { "x-bili-host-recovery-owner": "omp" });
+            } else if (id === children[1]) {
+                // An independently identified, registered legacy child may
+                // establish its own ledger on its very first request.
+                await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent, session_id: id }), { "x-bili-host-recovery-owner": "omp" });
+            }
+            await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent, biliJevHostSession: id }), headers);
+            const sent = JSON.parse(h.upstreams[0]!.lastBody!);
+            assert.equal(sent.prompt_cache_key, parent);
+            assert.ok(!("biliJevHostSession" in sent));
+        }
+        // Both siblings share the key. An old header copied from the parent
+        // or conflicting child headers cannot choose either child.
+        await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent }), headers);
+        await post(h, 0, "/v1/responses", responsesBody({ prompt_cache_key: parent, session_id: children[1] }), { ...headers, "session-id": children[0]! });
+        recordToolUseId("old-parent-call", parent);
+        const tool = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/tool`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: children[0], nativeCaller: true, toolCallId: "old-parent-call", tool: "compress", args: {} }),
+        });
+        assert.equal(tool.status, 409);
+        assert.equal((await tool.json() as { code: string }).code, "TOOL_CONVERSATION_CONFLICT");
+        const sessions = await getSessions(h);
+        assert.deepEqual(Object.fromEntries(sessions.map(s => [s.id, s.requests])), {
+            [parent]: 2, [children[0]!]: 1, [children[1]!]: 2,
+        });
+        for (const id of [parent, ...children]) {
+            const status = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=${encodeURIComponent(id)}`);
+            assert.equal(status.status, 200);
+            const state = await status.json() as { sessionId: string };
+            assert.equal(state.sessionId, id);
+        }
+    } finally {
+        await h.close();
+    }
+});
+
 test("e2e session identity: same conversation value continues across a protocol switch (relay translation, #286)", async () => {
     const h = await startHarness();
     try {
@@ -583,16 +637,23 @@ test("OMP Responses verifies each owner before touching a ledger; siblings never
             const sent = JSON.parse(h.upstreams[0]!.lastBody!);
             assert.equal(sent.prompt_cache_key, pck);
             assert.ok(!("biliJevHostSession" in sent));
+            assert.ok(!("biliJevCcr" in sent));
             assert.ok(!("x-bili-host-recovery-owner" in h.upstreams[0]!.lastHeaders!));
             return sent;
         };
         await send(first, {});
+        await send(first, { "x-bili-plugin": "omp" }, { biliJevCcr: false });
         await send(first, { ...ompResponsesHeaders, "x-bili-plugin": "codex" });
         await send(first, { ...ompResponsesHeaders, "user-agent": "codex_cli_rs/1.0" });
         await send(first, { ...ompResponsesHeaders, "x-bili-plugin-conversation": "different" });
         assert.deepEqual(await getSessions(h), [], "an unverified stamp cannot open even the provider-key ledger");
         await send(first, ompResponsesHeaders);
         assert.ok(ccrEnabled(resolveConversation(first).session));
+        await send(first, ompResponsesHeaders, { biliJevCcr: false });
+        assert.equal(resolveConversation(first).session?.id, first);
+        assert.ok(!ccrEnabled(resolveConversation(first).session), "an ordinary OMP turn disarms pruning on a trial listener");
+        await send(first, ompResponsesHeaders);
+        assert.ok(ccrEnabled(resolveConversation(first).session), "an opted-in turn with fresh proof can rearm pruning");
         const reg = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/register`, {
             method: "POST", body: JSON.stringify({ conversationId: "omp-owner-second", agent: "omp", identity: true }),
             headers: { "content-type": "application/json" },
