@@ -2160,8 +2160,8 @@ async function handleRequest(
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
         const jevHost = (parsed as Record<string, unknown>).biliJevHostSession;
-        const jevRequest = protocol === "openai" && process.env.BILI_JEV_CCR === "1" && opts.compress.ccr?.enabled === true
-            && (pluginAgent === "omp" || jevHost !== undefined);
+        const jevTrial = process.env.BILI_JEV_CCR === "1";
+        const jevRequest = jevTrial && protocol === "openai" && opts.compress.ccr?.enabled === true && jevHost !== undefined;
         if (jevRequest && req.headers[PF_DELTA_HEADER] !== undefined) {
             res.writeHead(400, { "content-type": "application/json", [MSGID_MODE_HEADER]: "full" });
             res.end(JSON.stringify({ error: { type: "pf_delta_reanchor", message: "Jev CCR needs the complete tool-result history" } }));
@@ -2638,7 +2638,9 @@ async function handleRequest(
         // placeholder is ever emitted; regular compress/decompress folding is unaffected
         // (the codex lane simply keeps large tool results verbatim until they are folded).
         // #3686: host policy, not wire profile — declared plugin hosts register bili's tools natively.
-        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexHost(req.headers)) ? pluginCcrStamp : undefined);
+        // On a shared trial listener, only an opted-in OMP client with a verified host ID can store results.
+        const storeArmed = (!jevTrial || (jevRequest && pluginMode)) && opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexHost(req.headers));
+        storeEffectiveCcr(session, storeArmed ? pluginCcrStamp : undefined);
         // #3400: acp_read_original_image arms where the model can actually reach
         // it — the injection lanes (proxy owns tool execution) or the plugin
         // lanes (the agent registers it natively from handlePluginManifest,
