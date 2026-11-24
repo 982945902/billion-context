@@ -8,6 +8,38 @@ type PartBoundMessage = CoreMessage & {
     [responsesPartBinding]?: { source: ResponseInputItem; part: ResponseContentPart; sourceId: string };
 };
 
+const jevProjections = new WeakSet<ResponsesProjection>();
+
+/** Bind the codec layout to this request's actual kernel ids. Without this
+ * a host-pinned call/result looks like a newly generated item on replay,
+ * dropping provider fields and moving opaque prefix items. Only the Jev
+ * lane uses this binding. No source wire item is mutated. */
+export function bindJevResponsesProjection(projection: ResponsesProjection, pinned: BiliMessage[] | null): void {
+    if (pinned) {
+        const ids = new Map(projection.msgs.map((m, i) => [m.id, pinned[i]!.id]));
+        for (const m of pinned as PartBoundMessage[]) {
+            const binding = m[responsesPartBinding];
+            if (binding) m[responsesPartBinding] = { ...binding, sourceId: m.id };
+        }
+        for (const slot of projection.layout) {
+            if (slot.coreId) slot.coreId = ids.get(slot.coreId)!;
+            if (slot.coreIds) slot.coreIds = slot.coreIds.map(id => ids.get(id)!);
+        }
+        if (projection.stringInput) projection.stringInput.coreId = ids.get(projection.stringInput.coreId)!;
+        projection.msgs = pinned;
+    }
+    for (const m of projection.msgs) {
+        if (m.contentType !== "tool-result") continue;
+        const output = (m.rawResponsesItem as ResponseInputItem | undefined)?.output;
+        // The common one-text-part envelope contains just one original
+        // string: archive its bytes, not a JSON-escaped representation.
+        // Multipart text keeps the codec's lossless JSON form.
+        if (Array.isArray(output) && output.length === 1 && output[0]?.type === "input_text" &&
+            typeof output[0].text === "string" && Object.keys(output[0]).length === 2) m.text = output[0].text;
+    }
+    jevProjections.add(projection);
+}
+
 export function responsesToolImageParts(item: unknown): ResponseContentPart[] | undefined {
     if (typeof item !== "object" || item === null) return undefined;
     const raw = item as Record<string, unknown>;
@@ -155,9 +187,21 @@ function boundProjection(projection: ResponsesProjection, messages: CoreMessage[
         previous = bound;
     }
     const sources = new Map(projection.msgs.map(message => [message.id, message]));
+    // The kernel patches function_call_output but intentionally passes opaque
+    // custom items through. On the Jev lane patch the exact custom result
+    // slot too, retaining its type, call_id, provider id and other fields.
+    const customOutputs = jevProjections.has(projection)
+        ? new Map(messages.filter(m => m.contentType === "tool-result").map(m => [m.id, m]))
+        : undefined;
     const replaced = new Set<string>();
     const rebound: BiliMessage[] = [];
     const layout = projection.layout.flatMap(slot => {
+        if (customOutputs && slot.coreId && slot.original.type === "custom_tool_call_output") {
+            const next = customOutputs.get(slot.coreId);
+            if (next && next.text !== sources.get(slot.coreId)?.text) {
+                return [{ ...slot, original: { ...slot.original, output: next.text ?? "" } }];
+            }
+        }
         const groups = runs.get(slot.original);
         if (!groups) return [slot];
         for (const id of slot.coreIds ?? (slot.coreId ? [slot.coreId] : [])) replaced.add(id);

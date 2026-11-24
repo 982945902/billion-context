@@ -1650,7 +1650,9 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 
 #### `ccr`
 
-**OMP Chat Completions 的 Jev 裁剪试验。** 开启全局 `compress.ccr.enabled`，并在试验 OMP 客户端和代理环境中设置 `BILI_JEV_CCR=1`。在客户端的 Jev harness 配置中设置 `trim: false`，使 bili 收到完整工具输出。代理默认从 `~/.pi/agent/jev-harness.json` 读取 `baseUrl`（含 `/v1/systemone` 的完整地址）、`apiKey` 和 `model`。可用 `BILI_JEV_CONFIG` 指定同格式的独立 JSON 文件，用 `BILI_JEV_API_KEY` 覆盖文件里的密钥。缺省地址和模型为 `http://127.0.0.1:3425/v1/systemone` 和 `group/jev`。每批最多 12 项，发送当前任务及限长摘录，网络判断预算 1.2 秒。失败或不确定时保留全文。
+**OMP 的 Jev 裁剪试验。** 代理开启 `compress.ccr.enabled` 和 `compress.ccr.jevTrial`，OMP 客户端设置 `BILI_JEV_CCR=1`。让 bili 收到完整工具输出；旧版 Jev harness 需要关闭自身的裁剪。支持 Chat Completions 和携带完整历史的 Responses。Responses 只有在原生取回工具可用、且能确认 OMP 会话所有者时才归档；不能只凭父子会话共享的模型缓存键判断归属。不含完整历史的续接请求不会创建新归档。
+
+代理从 `~/.pi/agent/jev-harness.json` 读取 `baseUrl`（完整 System One 地址）、`apiKey`、`model`；可用 `BILI_JEV_CONFIG` 指定另一份文件，用 `BILI_JEV_API_KEY` 覆盖其中的密钥。缺省地址为 `http://127.0.0.1:3425/v1/systemone`，模型为 `group/jev`。每批最多发 12 项限长摘录，网络预算 1.2 秒。判断失败、置信度不足或无法确认原文已持久化时，保留全文。
 
 - **类型：** `object`（`{ enabled?, minToolTokens?, excludeTools?, toolName?, maxHeadChars? }`）
 - **默认值：** *（全车道默认关闭（#1207 决策）— 未设置时保持关闭；在任意层级显式设置 `enabled: true` 方可启用（建议先本地验证）。插件通道同样需全局 `enabled: true` 才武装（#1271/#1273））*

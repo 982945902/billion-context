@@ -1,4 +1,5 @@
-import { collectCcrCandidates, defaultCountTokens, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { collectCcrCandidates, defaultCountTokens, parseStoredPlaceholder, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import type { BiliMessage, ResponseInputItem } from "acp-kernel/wire";
 import { judgeJevCcr } from "./jev-judge.js";
 import { getStore } from "./persist.js";
 import type { Session } from "./session.js";
@@ -18,10 +19,31 @@ export function jevReplayPolicy(session: Session): ReadonlySet<string> {
     return verified.get(session) ?? noIds;
 }
 
+/** A verified owner can still be missing its tool or fall back to a raw
+ * forward. Those results have now been shown in full, even if they used to
+ * have a recoverable archive. Do not re-shrink that prefix on retry. */
+export function rememberFullJevView(session: Session, messages: CoreMessage[]): void {
+    verified.delete(session);
+    const views: Views = Object.assign(Object.create(null), session.metadata.jevCcrViews);
+    for (const m of messages) if (m.contentType === "tool-result" && m.toolCallId) views[m.toolCallId] = false;
+    session.metadata.jevCcrViews = views;
+}
+
 function matchesOriginal(store: MessageContentStore | null, ref: string | undefined, message: CoreMessage): boolean {
     if (!store || !ref) return false;
     const entry = store.byRef[ref];
     return !!entry && entry.rawId === message.id && typeof message.text === "string" && store.byHash[entry.hash] === message.text;
+}
+
+/** Never send binary/opaque payloads to a text judge, or issue a text ref
+ * for an image-bearing result whose complete original cannot be restored. */
+function textualResult(m: BiliMessage): boolean {
+    const raw = m.rawResponsesItem as ResponseInputItem | undefined;
+    if (!raw) return true;
+    if (raw.call_id !== m.toolCallId || (raw.type !== "function_call_output" && raw.type !== "custom_tool_call_output") ||
+        (raw.status !== undefined && raw.status !== "completed") || raw.is_error === true) return false;
+    return typeof raw.output === "string" || (Array.isArray(raw.output) && raw.output.length > 0 &&
+        raw.output.every(part => part?.type === "input_text" && typeof part.text === "string"));
 }
 
 interface JevPlan {
@@ -54,9 +76,12 @@ export async function planJevCcr(session: Session, messages: CoreMessage[], conf
     for (const result of results) {
         const call = result.toolCallId!;
         const ref = session.state.messageRefs.byRaw[result.id];
-        // An archive from before opt-in or adopted at a fork is usable only
-        // if the current session can read the very same payload from disk.
-        if (!duplicates.has(call) && (!Object.hasOwn(views, call) || views[call] === result.id) &&
+        // A fold also archives original bytes. On Responses it is not proof
+        // that the model saw a placeholder: require its first-view decision
+        // or a matching view latch inherited with a fork's prefix.
+        const priorView = Object.hasOwn(views, call) ? views[call] === result.id :
+            (session.metadata.nativeRetrieveOnly !== true || (!!ref && parseStoredPlaceholder(session.state.viewLatches?.[ref]?.text ?? "")?.ref === ref));
+        if (!duplicates.has(call) && textualResult(result) && priorView &&
             matchesOriginal(disk, ref, result) && matchesOriginal(store, ref, result)) {
             views[call] = result.id;
             replayIds.add(result.id);
@@ -71,7 +96,7 @@ export async function planJevCcr(session: Session, messages: CoreMessage[], conf
     const fresh = new Set<string>();
     for (let i = messages.length - 1; i >= 0 && messages[i]!.contentType === "tool-result"; i--) {
         const call = messages[i]!.toolCallId;
-        if (call && !duplicates.has(call) && !Object.hasOwn(prior ?? {}, call)) fresh.add(call);
+        if (call && textualResult(messages[i]!) && !duplicates.has(call) && !Object.hasOwn(prior ?? {}, call)) fresh.add(call);
     }
     const userIndex = messages.findLastIndex(m => m.role === "user");
     const user = messages[userIndex];

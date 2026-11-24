@@ -381,6 +381,9 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     const startRaw = typeof args.startId === "string" ? args.startId.trim() : "";
     const endRaw = typeof args.endId === "string" ? args.endId.trim() : "";
     if (!startRaw || !endRaw) return toolFail("[decompress FAILED: startId and endId must be given together — pass both mNNNNN refs, or omit both to restore the whole block]");
+    if (ctx.session.metadata.nativeRetrieveOnly === true) {
+        return toolFail(`[decompress FAILED: this native Responses lane has no range delivery channel — omit startId/endId to restore the whole block, or retrieve a stored ref with its advertised tool]`);
+    }
     if (!ccrEnabled(ctx.session)) {
         // Range restore needs the CCR content store; a CCR-off session has none.
         // In plugin mode the model cannot enable CCR itself (it lives in the

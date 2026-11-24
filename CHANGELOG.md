@@ -7,7 +7,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Added
 
-- OMP Chat Completions can opt into Jev judgments for large tool outputs. The proxy uses CCR to preserve and retrieve originals selected for storage.
+- OMP Chat Completions and full-history Responses requests can use Jev to select large tool outputs for archival. A verified child session owns its originals even when it shares a provider cache key with its parent. Responses requests without a callable native retrieval tool retain their outputs.
 
 ### Removed
 - **compress-at-fold-point 整功能移除（owner 指令 2026-11-10，#6132；v1 #5471 + 未发布的 v2 #5949）**：删除 `compress.compressAtFoldPoint` / `compress.compressAtFoldPointClearThinking` 配置键、`BILI_COMPRESS_AT_FOLD_POINT` / `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` env、kernel 的 `relocate-compress-carriers` 管线节点与 `relocateCompressCarriers` / `planRelocateCompressCarriers` 导出、`Config.reasoningDroppable`、v2 的 `already-folded-echo` 解析 kind、web 配置行与 i18n 文案、config-reference/站点文档与博客文章（owner 指令直接删除）。移除原因：9 天内在其目标模型家族（qwen3-27b 系）出现两次不同的真实事故——2026-11-08 v1 引发的自发重复压缩循环（#5949 现场报告，v2 的设计动机）与 2026-11-10 生产会话（v0.1.213，v1 语义）中的作者误认：同轮「回答 + compress」被重放时，压缩对挪位后该轮回答文本裸挂在 transcript 尾部（无 pending 工具调用、无工具结果、无用户输入），27B 模型把自己的最后一条发言当成用户消息（m00376 链），重复回答了自己的答案且错误认知被固化进折叠块主题。v2 从未发布（最新 tag v0.1.213 仍为 v1，`git tag --contains` 为空），移除零迁移成本：开关关闭时布局就是移除后的布局（字节级一致）。旧配置残留的键：一次性 INERT 警告（`warnInertRemovedCompressKeys`，含 top-level 残留）并忽略值。kernel 0.0.192 → 0.0.193。回归面：`tests/removed-compress-keys-inert.test.ts`（新增移除键用例）、`tests/compress-reject-reasons.test.ts`（删除 echo 用例）、`kernel/tests/parse-compress-input.test.ts`（删除两个 pointer-echo 用例）、`kernel/tests/pipeline.test.ts`（节点清单）。

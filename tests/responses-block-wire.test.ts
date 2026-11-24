@@ -2,7 +2,29 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createCore, createInitialState, defaultConfig } from "acp-kernel";
 import type { ResponseInputItem } from "acp-kernel/wire";
-import { responsesToCoreWithToolImages as project, patchResponsesInputWithToolImages as patch, coreToResponsesWithToolImages as encode } from "../src/responses-tool-output.ts";
+import { bindJevResponsesProjection, responsesToCoreWithToolImages as project, patchResponsesInputWithToolImages as patch, coreToResponsesWithToolImages as encode } from "../src/responses-tool-output.ts";
+
+test("Jev changes only the selected pinned function/custom output and keeps replay layout", () => {
+    const text = "line 1\r\nline 2\n";
+    for (const custom of [false, true]) {
+        const kind = custom ? "custom_tool_call" : "function_call";
+        const input: ResponseInputItem[] = [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "run both" }] },
+            { type: "reasoning", id: "r0", summary: [], encrypted_content: "opaque" },
+            { type: kind, id: "c0", call_id: "run", name: "bash", ...(custom ? { input: "test" } : { arguments: "{}" }) },
+            { type: `${kind}_output`, id: "o0", call_id: "run", status: "completed", output: [{ type: "input_text", text }] },
+        ];
+        const projection = project({ input });
+        const pinned = projection.msgs.map((m, i) => ({ ...m, id: `host-${i}` }));
+        bindJevResponsesProjection(projection, pinned);
+        assert.deepEqual(patch(projection, pinned), input, "keep preserves the wire envelope, not JSON-escaped content");
+        assert.equal(pinned.at(-1)!.text, text, "archive the precise text including CRLF and final newline");
+        const rendered = pinned.map(m => m.contentType === "tool-result" ? { ...m, text: "stored result" } : m);
+        const expected = [...input.slice(0, -1), { ...input.at(-1)!, output: "stored result" }];
+        assert.deepEqual(patch(projection, rendered), expected, "stored output retains call_id, item id, kind and provider fields");
+        assert.deepEqual(patch(projection, rendered), expected, "a rebuild must not mutate the original or move the prefix");
+    }
+});
 
 function images(input: unknown): unknown[] {
     if (Array.isArray(input)) return input.flatMap(images);

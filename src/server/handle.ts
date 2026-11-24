@@ -21,7 +21,7 @@ import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports,
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
-import { buildCompressSystemPrompt } from "../compress-tool.js";
+import { buildCompressSystemPrompt, RETRIEVE_TOOL_NAME } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
@@ -32,7 +32,7 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient
 import { recordConflict } from "../conflict-watch.js";
 import { getStore } from "../persist.js";
 import { enterSessionContext, log as loggerLog } from "../logger.js";
-import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
+import { codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, preferZedThreadIdIdentity, qoderSideTaskConversation, zcodeMemoryConversation } from "../session-id.js";
@@ -56,7 +56,7 @@ import { opencodeForkParent } from "../opencode-fork-lineage.js";
 import { consumePluginRegisterFor, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
+import { BILI_HOST_RECOVERY_OWNER_HEADER, BILI_HOST_RECOVERY_OWNER_OMP, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
@@ -98,6 +98,42 @@ import { normalizeVertexModelId } from "../vertex.js";
 import { CREDENTIAL_HEADER_NAMES } from "../cache-ledger.js";
 import { requestModelFromBody } from "../upstream-throttle.js";
 import { tryAnswerEarlyHold } from "./relay.js";
+
+// Only a native function on THIS request can recover a stored result.
+// Deferred/MCP tools and declarations in prior turns are not a channel.
+function hasResponsesRetrieve(body: ResponsesRequestBody, name: string): boolean {
+    const choice = body.tool_choice;
+    if (choice != null && choice !== "auto" && choice !== "required") return false;
+    return Array.isArray(body.tools) && body.tools.some(tool => {
+        const t = tool as Record<string, unknown> | null;
+        return t?.type === "function" && t.name === name && t.defer_loading !== true;
+    });
+}
+
+function hasFullResponsesHistory(body: ResponsesRequestBody): boolean {
+    if (body.previous_response_id != null || body.conversation != null || body.context_management != null
+        || !Array.isArray(body.input) || hasCompactionPrompt(body.input)) return false;
+    let hasUser = false;
+    const calls = new Set<string>();
+    for (const item of body.input) {
+        if (!item || typeof item !== "object") return false;
+        if (item.type === undefined || item.type === "message") {
+            if (!(typeof item.content === "string" || Array.isArray(item.content))) return false;
+            if (item.role === "user") hasUser = true;
+            else if (item.role !== "system" && item.role !== "developer" && !(hasUser && item.role === "assistant")) return false;
+        } else if (item.type === "function_call" || item.type === "custom_tool_call") {
+            if (!hasUser || typeof item.call_id !== "string" || !item.call_id || calls.has(item.call_id)) return false;
+            calls.add(item.call_id);
+        } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
+            if (item.output === undefined || typeof item.call_id !== "string" || !calls.delete(item.call_id)) return false;
+        } else if (item.type !== "reasoning" || !hasUser) {
+            // Opaque compaction items, item references and unknown provider
+            // history shapes cannot prove the original input is present.
+            return false;
+        }
+    }
+    return hasUser && calls.size === 0;
+}
 
 // #5795: the credential subset of the inbound headers — exactly the names
 // credentialFingerprint reads (CREDENTIAL_HEADER_NAMES), or the fast path's
@@ -790,6 +826,38 @@ async function handleRequest(
             }
         }
     }
+    const jevTrial = opts.compress.ccr?.jevTrial === true || process.env.BILI_JEV_CCR === "1";
+    const responsesBody = protocol === "responses" ? parsed as ResponsesRequestBody | null : undefined;
+    const stampedResponses = responsesBody && Object.hasOwn(responsesBody, "biliJevHostSession") ? responsesBody : undefined;
+    let responsesOwner: string | undefined;
+    if (stampedResponses) {
+        const owner = stampedResponses.biliJevHostSession;
+        const agent = pluginAgentHeader(req.headers);
+        const claimed = pluginConversationHeader(req.headers);
+        const transportOwner = req.headers[BILI_HOST_RECOVERY_OWNER_HEADER];
+        // Never consult a ledger or a pending registration to guess the owner:
+        // siblings can share every provider affinity signal, including PCK.
+        if (jevTrial && typeof owner === "string" && owner.length > 0 && owner.length <= 512 && owner.trim() === owner
+            && (!agent || agent === "omp") && (!claimed || claimed === owner)
+            && (transportOwner === undefined || transportOwner === BILI_HOST_RECOVERY_OWNER_OMP)
+            && !isCodexHost(req.headers) && req.headers["x-bili-ws-lane"] === undefined
+            && req.headers["x-codex-turn-metadata"] === undefined) {
+            const registration = consumePluginRegisterFor(owner);
+            if (registration?.agent === "omp" || (!registration && transportOwner === BILI_HOST_RECOVERY_OWNER_OMP)) {
+                responsesOwner = owner;
+            }
+        }
+        delete stampedResponses.biliJevHostSession;
+        // /compact, chain continuations and other raw egress branches can
+        // forward bodyBuffer rather than the parsed object.
+        bodyText = JSON.stringify(stampedResponses);
+        bodyBuffer = Buffer.from(bodyText);
+        if (responsesOwner === undefined) {
+            await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(bodyBuffer, compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined);
+            return;
+        }
+    }
+    const ompProviderContinuation = responsesOwner !== undefined && (stampedResponses?.previous_response_id != null || stampedResponses?.conversation != null);
     // #7168/#7439: intercept DSH client extensions (default) — strip top-level
     // `dsh_*` so the 8 MiB `dsh_session_log` is never forwarded upstream. Gated by
     // the `passDshExtensions` rollout flag (default OFF = strip); release it once
@@ -1105,7 +1173,7 @@ async function handleRequest(
             const runtimeAgent = pluginAgentHeader(req.headers);
             const runtimeEntry = runtimeAgent !== undefined
                 ? pluginRuntimeInfoFor(runtimeAgent, model)
-                : pluginRuntimeInfoForConversation(runtimeConversationId(req.headers, parsed, opts.sessionHeader), model);
+                : pluginRuntimeInfoForConversation(responsesOwner ?? runtimeConversationId(req.headers, parsed, opts.sessionHeader), model);
             const runtimeWindow = pluginWindow === undefined ? runtimeEntry?.contextWindow : undefined;
             const launcherWindow = launcherContextWindow(model);
             const configuredModelEntry = resolveModelEntry(opts.routes, embeddedUrl, model);
@@ -1275,7 +1343,7 @@ async function handleRequest(
         // over content hashing, so IDE clients (ZCode/Cursor) that inject a
         // fixed system-reminder into every new conversation don't collide on a
         // shared 200-char prefix and leak compression state across sessions.
-        const clientConv = clientConversationHeader(req.headers);
+        const clientConv = responsesOwner ?? clientConversationHeader(req.headers);
         const convHeader = clientConv ?? sessionHeader;
         // Codex turn-metadata partitioning (#316 / PR-A): when the explicit
         // Codex turn metadata is present and cross-checked against the
@@ -1300,7 +1368,7 @@ async function handleRequest(
                         .filter((t) => t.length > 0)
                   : [];
         const claudeSub = protocol === "anthropic" ? claudeSubagentAgentId(req.headers, systemTextsForSplit) : undefined;
-        const responsesIdentity = protocol === "responses"
+        const responsesIdentity = responsesOwner !== undefined ? { value: responsesOwner, source: "header" as const, clientProvided: true } : protocol === "responses"
             ? preferZedThreadIdIdentity(
                   codexTurn
                       ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
@@ -1636,7 +1704,7 @@ async function handleRequest(
             )
             : undefined;
         const auxSidecar = zcodeMemory ?? qoderSideTask;
-        const conversation = auxSidecar !== undefined ? auxSidecar : protocol === "google"
+        const conversation = responsesOwner !== undefined ? responsesOwner : auxSidecar !== undefined ? auxSidecar : protocol === "google"
             // #2730: the google lane is persona-aware too — dsh stamps its one
             // conversation id on every wire including gemini (`x-bili-plugin: dsh`
             // is wire-agnostic, dsh-native.ts; MODEL_API_SUFFIX routes google
@@ -1989,7 +2057,7 @@ async function handleRequest(
         //    it stable for the session's life; pre-#2879 sessions keep the
         //    bare label (no migration). Others stay empty ("—" in the UI).
         const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
-        const affinity = affinityToken(bodyIdentity ?? {
+        const affinity = responsesOwner !== undefined ? stampedResponses?.prompt_cache_key : affinityToken(bodyIdentity ?? {
             value: clientConv ?? conversation,
             source: clientConv ? "header" : "generated",
             clientProvided: !!clientConv,
@@ -2137,6 +2205,10 @@ async function handleRequest(
                 derivedParent = identityAgent.parentConversationId;
             }
         }
+        if (responsesOwner !== undefined && !pluginAgent) {
+            pluginAgent = "omp";
+            pluginConversation = responsesOwner;
+        }
         if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined && claudeSub === undefined && zcodeMemory === undefined) {
             // A codex subagent thread mints a fresh session too, but it must
             // not claim the ROOT conversation's pending register (the plugin
@@ -2160,7 +2232,6 @@ async function handleRequest(
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
         const jevHost = (parsed as Record<string, unknown>).biliJevHostSession;
-        const jevTrial = opts.compress.ccr?.jevTrial === true || process.env.BILI_JEV_CCR === "1";
         const jevRequest = jevTrial && protocol === "openai" && opts.compress.ccr?.enabled === true && jevHost !== undefined;
         if (jevRequest && req.headers[PF_DELTA_HEADER] !== undefined) {
             res.writeHead(400, { "content-type": "application/json", [MSGID_MODE_HEADER]: "full" });
@@ -2538,7 +2609,7 @@ async function handleRequest(
         // header or session_id.
         if (zcodeMemory === undefined && (protocol === "responses" || protocol === "openai" || protocol === "anthropic")) {
             const pck = (parsed as { prompt_cache_key?: unknown }).prompt_cache_key;
-            if (typeof pck === "string" && pck.trim().length > 0 && (!jevRequest || pck.trim() === jevHost)) {
+            if (responsesOwner === undefined && typeof pck === "string" && pck.trim().length > 0 && (!jevRequest || pck.trim() === jevHost)) {
                 recordPluginSession(pck.trim(), session.id);
             }
         }
@@ -2605,13 +2676,8 @@ async function handleRequest(
         // unless this stamp says armed — the kernel's ccr-store node must never
         // substitute placeholders the wire cannot resolve (we must never emit a
         // placeholder the model cannot retrieve = silent loss).
-        // The responses wire stays out even in plugin mode: its developer-message /
-        // strict-alternation injection mechanics have no proven request-only carrier
-        // here (and no real plugin lane uses it), so arming it would risk silent loss.
-        // The responses text/marker protocol has no native tool channel either
-        // (absorb/rules strip themselves there for the same reason), and
-        // ACP_NO_INJECT_TOOL disables all injection on that wire — both would
-        // leave placeholders unretrievable.
+        // Responses plugin CCR requires a fresh OMP proof plus the native
+        // retrieve tool and self-contained history on THIS request.
         const storeChannelOk = protocol !== "responses" ||
             (!knobNoInjectTool() && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
         // [#1345/#1273] Plugin mode: the static manifest (handlePluginManifest
@@ -2626,8 +2692,14 @@ async function handleRequest(
         // proxy-lane-only (the proxy declares+dispatches per request under the
         // merged block, per-route renames intact); findCcrPluginDivergences warns
         // at config load about every divergent level/field.
+        const jevResponsesArmed = responsesOwner !== undefined && stampedResponses !== undefined
+            && pluginMode && pluginAgent === "omp" && pluginConversation === responsesOwner && session.id === responsesOwner
+            && opts.compress.ccr?.enabled === true && opts.compress.injectTool && storeChannelOk
+            && !responsesCompact && req.headers[PF_DELTA_HEADER] === undefined && req.headers["x-openai-internal-codex-responses-lite"] === undefined
+            && resolveCompressProtocol(opts.routes, providerDestUrl) !== "marker"
+            && hasResponsesRetrieve(stampedResponses, opts.compress.ccr.toolName ?? RETRIEVE_TOOL_NAME) && hasFullResponsesHistory(stampedResponses);
         const pluginCcrStamp = pluginMode
-            ? (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true ? opts.compress.ccr : undefined)
+            ? ((ccrPluginWireOk(protocol) || jevResponsesArmed) && opts.compress.ccr?.enabled === true ? opts.compress.ccr : undefined)
             : (resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
         // [#3272/#3266] Same structural gate as the removed image_full restore channel (#3270):
         // the codex host rejects bili-injected tools at its tool router and records a
@@ -2639,8 +2711,9 @@ async function handleRequest(
         // (the codex lane simply keeps large tool results verbatim until they are folded).
         // #3686: host policy, not wire profile — declared plugin hosts register bili's tools natively.
         // On a shared trial listener, only an opted-in OMP client with a verified host ID can store results.
-        const storeArmed = (!jevTrial || (jevRequest && pluginMode)) && opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexHost(req.headers));
-        storeEffectiveCcr(session, storeArmed ? pluginCcrStamp : undefined);
+        const storeArmed = jevResponsesArmed || ((!jevTrial || (jevRequest && pluginMode)) && opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexHost(req.headers)));
+        const requestCcr = storeArmed ? pluginCcrStamp : undefined;
+        if (!jevTrial) storeEffectiveCcr(session, requestCcr);
         // #3400: acp_read_original_image arms where the model can actually reach
         // it — the injection lanes (proxy owns tool execution) or the plugin
         // lanes (the agent registers it natively from handlePluginManifest,
@@ -3014,6 +3087,7 @@ async function handleRequest(
                       : requestStream,
                 compressInjected: false,
                 sidePassthrough: true,
+                preserveProviderCacheKey: responsesOwner !== undefined,
             };
             logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
             await forward(req, res, opts, sideBody, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
@@ -3116,7 +3190,7 @@ async function handleRequest(
                 const runtimeMax = (pluginHeadersMatchModel(req.headers, fbModel0) ? pluginReportedMaxOutput(req.headers) : undefined)
                     ?? (fbAgent !== undefined
                         ? pluginRuntimeInfoFor(fbAgent, fbModel0)?.maxOutput
-                        : pluginRuntimeInfoForConversation(runtimeConversationId(req.headers, parsed, opts.sessionHeader), fbModel0)?.maxOutput);
+                        : pluginRuntimeInfoForConversation(responsesOwner ?? runtimeConversationId(req.headers, parsed, opts.sessionHeader), fbModel0)?.maxOutput);
                 if (typeof runtimeMax === "number" && runtimeMax > 0) {
                     maxOutput = runtimeMax;
                     if (!headroomFallbackLogged.has(`${fbModel0 ?? "?"}|runtime-info`)) {
@@ -3284,6 +3358,10 @@ async function handleRequest(
                 respondFailFast: boolean,
                 overflowWindow?: number,
             ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
+                // A Jev judgment awaits network and disk under the session
+                // lock. A concurrent request must not disarm it (or borrow
+                // its policy). Reapply this request's policy on refolds too.
+                if (jevTrial) storeEffectiveCcr(session, requestCcr, jevResponsesArmed);
                 const runPrepareInner = async (): Promise<Prepared> => {
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
@@ -3405,14 +3483,15 @@ async function handleRequest(
                     // already owns: no kernel, no dev injection, no plane
                     // side effects — the response-side ingest still updates
                     // the session from the answer).
-                    const pureChainContinuation =
-                        protocol === "responses" &&
-                        !responsesCompact &&
-                        !wsLaneEnvelope &&
-                        pluginMode &&
-                        typeof (work as ResponsesRequestBody).previous_response_id === "string" &&
-                        (work as ResponsesRequestBody).previous_response_id!.length > 0 &&
-                        (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0);
+                    const pureChainContinuation = protocol === "responses" && !responsesCompact && !wsLaneEnvelope && (
+                        // An OMP client may supply a nonempty *delta* beside
+                        // either provider chain handle. Never drop that handle
+                        // or reinterpret the delta as the entire transcript.
+                        ompProviderContinuation ||
+                        (pluginMode && typeof (work as ResponsesRequestBody).previous_response_id === "string"
+                            && (work as ResponsesRequestBody).previous_response_id!.length > 0
+                            && (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0))
+                    );
                     const preparedOut = protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
@@ -3424,11 +3503,12 @@ async function handleRequest(
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
                             // forward it unchanged (byte-identical passthrough).
                             ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide);
+                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, jevResponsesArmed, responsesOwner !== undefined);
                     // The resolved model rides with the prepared request: on the
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
                     preparedOut.model = requestModel;
+                    if (responsesOwner !== undefined) preparedOut.preserveProviderCacheKey = true;
                     // #6181 B3: the compact-passthrough base hard-codes
                     // resetAfterSuccess — which schedules a native-compaction
                     // REBASE for the next Responses turn (reconcileNative-
@@ -3762,7 +3842,7 @@ async function handleRequest(
                 // ALWAYS refused — its refusal has no user-side fix yet, only
                 // bili shipping the re-signer. Passthrough settings are inert
                 // for those schemes.
-                if (guardScheme === APIG_RESIGN_SCHEME && guardResign.passthrough) {
+                if (guardScheme === APIG_RESIGN_SCHEME && guardResign.passthrough && responsesOwner === undefined) {
                     clearSignedRefusal(guardScheme);
                     log("warn", `[signed-passthrough] built-in-scheme request without a working re-sign arm forwarded byte-untouched, no compression (#1884 escape hatch via resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH — the user has acknowledged this link runs uncompressed)`);
                     forwarded = true;

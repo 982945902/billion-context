@@ -192,6 +192,9 @@ test("CCR v2 range decompress: failure modes queue nothing", () => {
     assert.equal(f.session.stats.rangeRestores, 0);
     const g = fold({ ccr: false });
     assert.match(resolveDecompress({ blockId: g.blockId, startId: "m00002", endId: "m00004" }, ctxOf(g)).text, /requires CCR/);
+    storeEffectiveCcr(f.session, { enabled: true }, true);
+    assert.match(resolveDecompress({ blockId: f.blockId, startId: "m00002", endId: "m00004" }, ctx).text, /no range delivery channel/);
+    assert.equal(drainPendingRetrievals(f.session).length, 0, "Jev Responses never queues a synthetic user message");
 });
 
 test("CCR v2 whole-block decompress behavior unchanged", () => {

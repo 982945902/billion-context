@@ -23,6 +23,9 @@ type ProxyOptions = import("../src/config.ts").ProxyOptions;
 const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
 const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
 const { _resetSessionsForTest } = await import("../src/session.ts");
+// These modules read persistence config on import; use the test XDG roots above.
+const { resolveConversation } = await import("../src/plugin.ts");
+const { ccrEnabled } = await import("../src/store.ts");
 
 after(() => {
     delete process.env.XDG_STATE_HOME;
@@ -81,16 +84,19 @@ interface MockUpstream {
     port: number;
     /** Headers of the most recent POST, lowercased — for passthrough assertions (#2779). */
     lastHeaders?: Record<string, string>;
+    lastBody?: string;
     close(): Promise<void>;
 }
 
 async function startMockUpstream(): Promise<MockUpstream> {
     let lastHeaders: Record<string, string> | undefined;
+    let lastBody: string | undefined;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             if (req.method === "POST") {
+                lastBody = Buffer.concat(chunks).toString("utf8");
                 lastHeaders = {};
                 for (const [k, v] of Object.entries(req.headers)) {
                     if (v !== undefined) lastHeaders[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : v;
@@ -116,6 +122,7 @@ async function startMockUpstream(): Promise<MockUpstream> {
         server,
         port,
         get lastHeaders() { return lastHeaders; },
+        get lastBody() { return lastBody; },
         close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
     };
 }
@@ -126,7 +133,7 @@ interface Harness {
     close(): Promise<void>;
 }
 
-async function startHarness(upstreamCount = 1): Promise<Harness> {
+async function startHarness(upstreamCount = 1, trial?: "tools" | "marker" | "no-inject"): Promise<Harness> {
     const upstreams: MockUpstream[] = [];
     for (let i = 0; i < upstreamCount; i++) upstreams.push(await startMockUpstream());
     _resetSessionsForTest();
@@ -134,7 +141,7 @@ async function startHarness(upstreamCount = 1): Promise<Harness> {
     setRegistryForTest({});
     const routes: ProxyOptions["routes"] = {};
     for (const u of upstreams) {
-        routes[`http://127.0.0.1:${u.port}`] = { models: { "gpt-test": { context: 100_000 }, "claude-test": { context: 100_000 } } };
+        routes[`http://127.0.0.1:${u.port}`] = { models: { "gpt-test": { context: 100_000 }, "claude-test": { context: 100_000 } }, ...(trial === "marker" ? { compressProtocol: "marker" } : {}) };
     }
     const proxy = await startServer({
         port: 0,
@@ -143,7 +150,7 @@ async function startHarness(upstreamCount = 1): Promise<Harness> {
         routes,
         modelContextLimit: 100_000,
         kernelConfig: defaultConfig(100_000),
-        compress: { injectTool: true, injectNudge: true },
+        compress: { injectTool: trial !== "no-inject", injectNudge: true, ...(trial ? { ccr: { enabled: true, jevTrial: true } } : {}) },
         promptCache: { routing: "auto" },
         log: false,
         sessionHeader: "x-acp-session",
@@ -558,6 +565,75 @@ test("e2e session identity: plugin-stamped identity still outranks the native op
         assert.equal(sessions.length, 1, `expected 1 plugin-keyed session, got ${JSON.stringify(sessions)}`);
         assert.equal(sessions[0]!.id, "plugin-conv-1");
         assert.equal(sessions[0]!.requests, 2);
+    } finally {
+        await h.close();
+    }
+});
+
+const ompResponsesHeaders = { "x-bili-host-recovery-owner": "omp" };
+const ompRetrieveTools = ["bash", "acp_retrieve"].map(name => ({ type: "function", name, parameters: { type: "object" } }));
+
+test("OMP Responses verifies each owner before touching a ledger; siblings never claim the provider PCK", async () => {
+    const h = await startHarness(1, "tools");
+    try {
+        const pck = "omp-owner-provider-key";
+        const first = "omp-owner-first";
+        const send = async (owner: string, headers: Record<string, string>, extra: Record<string, unknown> = {}, path = "/v1/responses") => {
+            await post(h, 0, path, responsesBody({ prompt_cache_key: pck, biliJevHostSession: owner, tools: ompRetrieveTools, ...extra }), headers);
+            const sent = JSON.parse(h.upstreams[0]!.lastBody!);
+            assert.equal(sent.prompt_cache_key, pck);
+            assert.ok(!("biliJevHostSession" in sent));
+            assert.ok(!("x-bili-host-recovery-owner" in h.upstreams[0]!.lastHeaders!));
+            return sent;
+        };
+        await send(first, {});
+        await send(first, { ...ompResponsesHeaders, "x-bili-plugin": "codex" });
+        await send(first, { ...ompResponsesHeaders, "user-agent": "codex_cli_rs/1.0" });
+        await send(first, { ...ompResponsesHeaders, "x-bili-plugin-conversation": "different" });
+        assert.deepEqual(await getSessions(h), [], "an unverified stamp cannot open even the provider-key ledger");
+        await send(first, ompResponsesHeaders);
+        assert.ok(ccrEnabled(resolveConversation(first).session));
+        const reg = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/register`, {
+            method: "POST", body: JSON.stringify({ conversationId: "omp-owner-second", agent: "omp", identity: true }),
+            headers: { "content-type": "application/json" },
+        });
+        assert.equal(reg.status, 200, await reg.text());
+        await send("omp-owner-second", {}); // launcher lane: exact registration instead of the native transport header
+        assert.equal(resolveConversation(first).session?.id, first);
+        assert.equal(resolveConversation("omp-owner-second").session?.id, "omp-owner-second");
+        assert.equal(resolveConversation(pck).session, undefined);
+        const continuation = await send(first, ompResponsesHeaders, { previous_response_id: "resp-provider", input: [{ role: "user", content: "delta" }] });
+        assert.equal(continuation.previous_response_id, "resp-provider");
+        assert.deepEqual(continuation.input, [{ role: "user", content: "delta" }]);
+        assert.ok(!ccrEnabled(resolveConversation(first).session));
+        await send(first, ompResponsesHeaders, {}, "/v1/responses/compact");
+        assert.ok(!ccrEnabled(resolveConversation(first).session));
+        for (const extra of [
+            { tools: [{ type: "tool_search" }, { ...ompRetrieveTools[1], defer_loading: true }] },
+            { tool_choice: "none" },
+            { context_management: [{ type: "compaction", compact_threshold: 1000 }] },
+            { conversation: "conv_retained" },
+            { input: [{ type: "item_reference", id: "msg_retained" }, { role: "user", content: "new" }] },
+            { input: [{ role: "user", content: "new" }, { type: "function_call_output", call_id: "missing", output: "unpaired" }] },
+        ]) {
+            await send(first, ompResponsesHeaders, extra);
+            assert.ok(!ccrEnabled(resolveConversation(first).session), JSON.stringify(extra));
+        }
+    } finally {
+        await h.close();
+    }
+});
+
+for (const mode of ["marker", "no-inject"] as const) test(`OMP Responses ${mode} never arms a retrieve channel`, async () => {
+    const h = await startHarness(1, mode);
+    try {
+        const owner = `omp-owner-${mode}`;
+        await post(h, 0, "/v1/responses", responsesBody({ biliJevHostSession: owner, tools: ompRetrieveTools }), ompResponsesHeaders);
+        const session = resolveConversation(owner).session;
+        assert.equal(session?.id, owner);
+        assert.ok(!ccrEnabled(session));
+        const sent = JSON.parse(h.upstreams[0]!.lastBody!);
+        assert.ok(!("prompt_cache_key" in sent) && !("biliJevHostSession" in sent));
     } finally {
         await h.close();
     }

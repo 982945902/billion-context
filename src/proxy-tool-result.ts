@@ -1,3 +1,5 @@
+import type { RetrievalExport } from "acp-kernel";
+
 // #1875: machine-readable business outcome for executed proxy tools. The HTTP
 // envelope's ok already means "transport + execution succeeded"; outcome adds
 // whether the REQUESTED EFFECT happened. Compress is tri-valued (applied /
@@ -46,6 +48,8 @@ export interface ProxyToolResult {
     // rides them as an ephemeral carrier message; plugin-lane hosts open the
     // local path named in the receipt text instead (string protocol).
     image?: { base64: string; mediaType: string };
+    /** Exact export written by this retrieve; exposed only to native hosts. */
+    retrievalExport?: RetrievalExport;
 }
 
 export function toolOk(text: string): ProxyToolResult {

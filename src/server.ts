@@ -2067,6 +2067,9 @@ export type Prepared = {
      *  merges them onto the upstream response headers. */
     responseExtraHeaders?: Record<string, string>;
     responsesTextProtocol?: boolean;
+    /** The native host owns the provider key, including its absence: retries
+     * must not silently substitute or drop it to probe a different cache. */
+    preserveProviderCacheKey?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];

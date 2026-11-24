@@ -26,6 +26,7 @@ billion-context/
 │   │   ├── observability.ts      #   Body dumps (dumps/req-*.json, raw/*), unrecognized-path stats
 │   │   ├── prepare-anthropic.ts  #   Anthropic request preparation (fold → rebuild → system/nudge injection) (#1440)
 │   │   ├── prepare-google.ts     #   Gemini request preparation incl. :countTokens twin (#1440)
+│   │   ├── prepare-ccr-turn.ts   #   Apply first-view decisions and verify durable originals before returning placeholders
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)

@@ -22,7 +22,7 @@ import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { absorbAbortedTurnGrowth, nudgeStampsOf, restoreNudgeStamps, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, nudgeStampsOf, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, type PendingRetrieval, type Session } from "../session.js";
 import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
@@ -31,8 +31,8 @@ import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, ab
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { buildBlockOpsSystemPrompt } from "acp-kernel";
-import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
-import { confirmJevCcr, jevCcrActive, planJevCcr } from "../jev-ccr.js";
+import { ccrEnabled, ccrLoopConfig, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
+import { jevCcrActive } from "../jev-ccr.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -44,7 +44,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
-import { SessionStore } from "../persist.js";
+import { processPreparedCcrTurn } from "./prepare-ccr-turn.js";
 import { FoundationRejectError } from "../snapshot/plane.js";
 import { runStage0 } from "../snapshot/stage0.js";
 import { applyImageRescalePass } from "../image-rescale.js";
@@ -516,16 +516,6 @@ export async function prepareOpenai(
         // nudge-carrying request rolls the cadence back to pre-turn (lane
         // mirror of the anthropic-lane fix).
         nudgeStampsBefore = nudgeStampsOf(session);
-        const inputStore = contentStoreOf(session);
-        const inputState = session.state;
-        const jevPlan = jev ? await planJevCcr(session, renderMsgs, loopConfig, inputStore) : undefined;
-        const previousStoreStats = jevPlan?.storeIds.size ? { storedBytes: session.stats.storedBytes, storeBytesSaved: session.stats.storeBytesSaved } : undefined;
-        const turnInput = { messages: renderMsgs, state: inputState, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: inputStore } as const;
-        let turn = core.processTurn(jevPlan && loopConfig.ccr ? { ...turnInput, config: { ...loopConfig, ccr: { ...loopConfig.ccr, storePolicy: jevPlan.storeIds, replayPolicy: jevPlan.replayIds } } } : turnInput);
-        session.state = turn.state;
-        const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
-        if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
-        adoptContentStore(session, turn.contentStore);
         // In-request ledger flush: the transcript up to THIS user message is
         // durable before the model call (#3397 durability-before-render) and
         // the stage-0 envelope / M2 evidence read a current ledger.
@@ -550,7 +540,6 @@ export async function prepareOpenai(
             wpHit !== undefined && s0.pinned !== null && s0.pinned.length === wpHit.totalT
                 ? s0.pinned.slice(s0.pinned.length - wpHit.windowCores.length)
                 : wpHit?.windowCores;
-        snapshotMessages(session, ledgerWindow ?? originalMessages);
         // #7064 ledger drain: on a watermark-HIT turn that snapshot is the
         // ~2-row tail WINDOW — a verified suffix of the ledger (head check +
         // pf-seq vouch for the prefix), NOT the complete log. Claiming rawness
@@ -565,21 +554,10 @@ export async function prepareOpenai(
         // (KDD#21 水位线以下存活行). Every consumer of the flag already treats
         // "pruned view, not raw log" as the skip-sweep / skip-append contract
         // (persist tail selection, ingest tail_json, handoff stash, export).
-        if (wpHit !== undefined) session.lastMessagesFolded = true;
-        snapFlush = await SessionStore.flushOrSkip(session);
-        if (jevPlan && !confirmJevCcr(session, jevPlan, snapFlush.ok)) {
-            // The trial view and its latch have never left the proxy. Restore
-            // the previous originals and render from the pre-turn state so
-            // every later pass sees the same full-text decision.
-            session.contentStore = inputStore;
-            session.contentStoreDirty = true;
-            if (previousStoreStats) Object.assign(session.stats, previousStoreStats);
-            turn = core.processTurn({ ...turnInput, config: ccrLoopConfig(session, loopConfig) });
-            session.state = turn.state;
-            if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
-            snapFlush = await SessionStore.flushOrSkip(session);
-            log("warn", `[${sessionId}] Jev CCR original or decision could not be verified on disk; forwarded full tool results`);
-        }
+        const { turn, nudgeHeldAfterReject, flush } = await processPreparedCcrTurn(core, session,
+            { messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy },
+            jev, ledgerWindow ?? originalMessages, wpHit !== undefined, nudgeStampsBefore, log);
+        snapFlush = flush;
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
