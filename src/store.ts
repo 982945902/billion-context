@@ -4,6 +4,7 @@ import {
     contentStoreStats,
     createContentStore,
     DEFAULT_CCR_CONFIG,
+    frameRetrievedOriginal,
     noteRetrieval,
     RETRIEVE_TOOL_NAME,
     type Config as KernelConfig,
@@ -11,12 +12,13 @@ import {
     type MessageContentStore,
     type RetrievalExport,
 } from "acp-kernel";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { log as loggerLog } from "./logger.js";
 import { stateDir } from "./paths.js";
 import { getStore } from "./persist.js";
+import { jevCcrActive, jevReplayPolicy } from "./jev-ccr.js";
 import type { CompressSettings } from "./config.js";
 import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
 import type { PendingRetrieval, Session } from "./session.js";
@@ -28,8 +30,10 @@ const EFFECTIVE_CCR_KEY = "effectiveCcr";
 
 /** Stamp the last-resolved CCR policy onto the session (per-request; the
  *  processTurn loop config must match or be stripped, mirroring absorb). */
-export function storeEffectiveCcr(session: Session, ccr: CcrSettings | undefined): void {
+export function storeEffectiveCcr(session: Session, ccr: CcrSettings | undefined, nativeRetrieveOnly = false): void {
     session.metadata[EFFECTIVE_CCR_KEY] = ccr ?? null;
+    if (nativeRetrieveOnly) session.metadata.nativeRetrieveOnly = true;
+    else delete session.metadata.nativeRetrieveOnly;
     // [review #1273] Disarming must also drop any queued full-text injection:
     // a retrieve issued on a lane that later switches to a non-CCR wire
     // (responses/google, or the plugin base-config gate above) would otherwise
@@ -37,11 +41,11 @@ export function storeEffectiveCcr(session: Session, ccr: CcrSettings | undefined
     // an unrelated conversation point. [#1343] The drop is now OBSERVABLE —
     // every acked-but-undelivered ref is logged with its reason and a
     // corrective note is queued, instead of a silent truncate.
-    if (!ccr) {
+    if (!ccr || nativeRetrieveOnly) {
         const carrierRefs = carrierOf(session).map((p) => p.ref);
         const ledgerRefs = readLedger(session).map((e) => e.ref);
         const allRefs = [...new Set([...carrierRefs, ...ledgerRefs])];
-        if (allRefs.length > 0) dropRetrievals(session, allRefs, "CCR disarmed before delivery");
+        if (allRefs.length > 0) dropRetrievals(session, allRefs, nativeRetrieveOnly ? "native retrieval has no queued delivery channel" : "CCR disarmed before delivery");
     }
 }
 
@@ -95,16 +99,14 @@ export function ccrLoopConfig(session: Session | undefined, config: KernelConfig
     if (!ccrEnabled(session)) return { ...config, ccr: undefined };
     const eff = effectiveCcr(session);
     if (!eff) return config;
+    if (session?.metadata.nativeRetrieveOnly === true || (jevCcrActive(session) && (session.meta.protocol === "openai" || session.metadata.jevCcrViews !== undefined))) {
+        return { ...config, ccr: { ...DEFAULT_CCR_CONFIG, ...eff, storePolicy: new Set(), replayPolicy: jevReplayPolicy(session) } };
+    }
     return { ...config, ccr: { ...DEFAULT_CCR_CONFIG, ...eff } };
 }
 
-// [#1271] Wire protocols that support plugin-mode CCR. The agent advertises
-// acp_retrieve from the manifest and rides the full original back via the
-// request-only injection in prepare* — which exists only for these two wires.
-// google (strict role-alternation) and responses (fragile developer-message
-// mechanics, no real plugin lane) are excluded so a placeholder is never emitted
-// on a wire that cannot round-trip it (silent loss, #1097). The arming gate and
-// the drain sites must stay in lockstep with this set.
+// [#1271] Default plugin CCR wires. Verified full-history OMP Responses is
+// a per-request Jev exception, not a capability of arbitrary Responses hosts.
 export const PLUGIN_CCR_WIRES: ReadonlySet<string> = new Set(["anthropic", "openai"]);
 
 export function ccrPluginWireOk(protocol: string): boolean {
@@ -193,7 +195,7 @@ export function cloneStoreForRefs(store: MessageContentStore, refs: Iterable<str
  *  count hit/miss, and return the framed original IN THE TOOL RESULT ITSELF
  *  (GHSA jc6g v2: untrusted data rides back at the trust tier it came from,
  *  never as a host-synthesized system message). Originals at or above the
- *  inline threshold are exported to <stateDir>/retrieve/<ref>.txt and the
+ *  inline threshold are exported under a session-private directory and the
  *  tool result carries a file pointer the model reads with its file tool.
  *  A hallucinated ref costs one tool call by design. */
 export function executeRetrieve(args: Record<string, unknown>, session: Session): ProxyToolResult {
@@ -204,7 +206,7 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         return toolFail(`[${retrieveToolName(session)} FAILED: ref (an mNNNNN id) is required]`);
     }
-    const result = applyRetrieve({ store: contentStoreOf(session), ref, exportDir: retrievalExportDir() });
+    const result = applyRetrieve({ store: contentStoreOf(session), ref, exportDir: retrievalExportDir(session.id) });
     if (!result.ok) {
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         loggerLog("info", `[ccr] retrieve ${ref}: miss (${result.reason})`);
@@ -213,31 +215,34 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
     session.stats.retrieveHits = (session.stats.retrieveHits ?? 0) + 1;
     session.state = noteRetrieval(session.state);
     recordRetrieveHit(session, ref);
-    if (result.export !== undefined && !writeRetrievalExport(result.export)) {
-        // The pointer names a file we could not write — degrade to a bounded
-        // head preview instead of handing the model a dead path.
-        return toolFail(`[${retrieveToolName(session)} FAILED: could not write ${result.export.path} — head preview follows]\n${result.entry.head}`);
+    let exported = result.export;
+    let text = result.toolResultText;
+    if (exported && !writeRetrievalExport(exported)) {
+        if (session.metadata.nativeRetrieveOnly !== true) {
+            return toolFail(`[${retrieveToolName(session)} FAILED: could not write ${exported.path} — head preview follows]\n${result.entry.head}`);
+        }
+        // Jev made the original invisible on the promise of recovery. If
+        // file export is unavailable, deliver the exact framed bytes inline.
+        text = frameRetrievedOriginal(ref, result.entry, result.text);
+        exported = undefined;
     }
     // Delivery is the tool result itself (the #1343 queued-injection
     // lifecycle is retired for CCR): the hit is delivered the moment this
     // returns, so it counts as delivered now — nothing left to queue.
     session.stats.retrieveDelivered = (session.stats.retrieveDelivered ?? 0) + 1;
-    loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars${result.export ? `, exported ${result.export.path}` : ""})`);
-    return toolOk(result.toolResultText);
+    loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars${exported ? `, exported ${exported.path}` : ""})`);
+    return exported ? { text, outcome: "success", retrievalExport: exported } : toolOk(text);
 }
 
-/** Host side of the kernel RetrievalExport effect: exports land under
- *  <stateDir>/retrieve/<ref>.txt with 0600 (folded conversation content is
- *  not world-readable on multi-user hosts), parents created on demand.
- *  Content-addressed by ref, so a repeated retrieve rewrites identical
- *  bytes (idempotent; the kernel already deduped by content). */
-function retrievalExportDir(): string {
-    return join(stateDir(), "retrieve");
+/** Refs are session-local (two children can both own m00004). Hash the
+ * actual session id, never a provider cache key or a client path segment. */
+function retrievalExportDir(sessionId: string): string {
+    return join(stateDir(), "retrieve", createHash("sha256").update(sessionId).digest("hex"));
 }
 
 function writeRetrievalExport(exported: RetrievalExport): boolean {
     try {
-        mkdirSync(dirname(exported.path), { recursive: true });
+        mkdirSync(dirname(exported.path), { recursive: true, mode: 0o700 });
         writeFileSync(exported.path, exported.text, { encoding: "utf8", mode: 0o600 });
         return true;
     } catch (e) {

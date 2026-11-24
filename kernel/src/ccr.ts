@@ -1,13 +1,15 @@
 import type {
   CcrConfig,
+  CcrStorePolicy,
   Config,
   CompressionState,
   CoreMessage,
 } from "./types.js";
 import { refForRaw, BLOCKED_REF } from "./refs.js";
-import { ACP_TOOL_NAMES, BLOCK_OP_TOOL_NAMES } from "./compress-tools.js";
+import { ABSORB_TOOL_NAME, ACP_TOOL_NAMES, BLOCK_OP_TOOL_NAMES } from "./compress-tools.js";
 import {
   collectFailedCompressCallIds,
+  isCompressToolName,
   collectProtectedToolCallIds,
   isMessageProtectedWithPairing,
   matchToolPattern,
@@ -447,6 +449,76 @@ export interface StoreLargeResultsResult {
   storedCount: number;
 }
 
+export interface CcrCandidate {
+  message: CoreMessage;
+  call?: CoreMessage;
+  tokens: number;
+}
+
+function isExcludedCcrTool(name: string | undefined, cfg: CcrConfig): boolean {
+  return !!name && (
+    ACP_TOOL_NAMES.has(name) || BLOCK_OP_TOOL_NAMES.has(name) ||
+    name === cfg.toolName ||
+    cfg.excludeTools.some((pattern) => matchToolPattern(name, pattern))
+  );
+}
+
+function isPolicyReceipt(name: string | undefined, config: Config): boolean {
+  return !!name && (
+    name === RETRIEVE_TOOL_NAME || name === ABSORB_TOOL_NAME ||
+    name === config.absorb?.toolName || isCompressToolName(name, config)
+  );
+}
+
+/** Inspect both fresh results and replays against the current store, so
+ *  repeated refs in a single pass preserve the first archived original. */
+function createCcrInspector(input: StoreLargeResultsInput, cfg: CcrConfig, hostPolicy: boolean) {
+  const callById = new Map<string, CoreMessage>();
+  for (const m of input.messages) {
+    if (m.contentType === "tool-call" && m.toolCallId) callById.set(m.toolCallId, m);
+  }
+  const protectedCalls = collectProtectedToolCallIds(input.messages, input.config);
+  const failedCalls = collectFailedCompressCallIds(input.messages, input.config);
+  return (message: CoreMessage, store: MessageContentStore, policy?: CcrStorePolicy) => {
+    if (message.contentType !== "tool-result" || !message.toolCallId || !message.text) return;
+    const ref = refForRaw(input.state.messageRefs, message.id);
+    if (!ref || ref === BLOCKED_REF || parseStoredPlaceholder(message.text)?.ref === ref) return;
+    const call = callById.get(message.toolCallId);
+    if (isExcludedCcrTool(message.toolName, cfg) ||
+        isMessageProtectedWithPairing(message, input.config, protectedCalls, failedCalls)) return;
+    const existing = store.byRef[ref];
+    if (existing) {
+      if (cfg.replayPolicy !== undefined &&
+          (existing.rawId !== message.id || !cfg.replayPolicy.has(message.id))) return;
+      return { ref, call, existing, text: message.text };
+    }
+    if (hostPolicy && (isExcludedCcrTool(call?.toolName, cfg) ||
+        isPolicyReceipt(message.toolName, input.config) || isPolicyReceipt(call?.toolName, input.config))) return;
+    if (policy !== undefined && !policy.has(message.id)) return;
+    const tokens = input.countTokens(message.text);
+    if (tokens < cfg.minToolTokens) return;
+    return { ref, call, tokens, text: message.text };
+  };
+}
+
+/** @internal Input is the referenced, pruned CCR pipeline view. */
+export function collectNewCcrResults(
+  input: StoreLargeResultsInput,
+  previousRefs: CompressionState["messageRefs"],
+): CcrCandidate[] {
+  const inspect = createCcrInspector(input, resolveCcrConfig(input.config), true);
+  const candidates: CcrCandidate[] = [];
+  const seen = new Set<string>();
+  for (const message of input.messages) {
+    if (refForRaw(previousRefs, message.id) || seen.has(message.id)) continue;
+    const result = inspect(message, input.store);
+    if (result?.tokens === undefined) continue;
+    candidates.push({ message, call: result.call, tokens: result.tokens });
+    seen.add(message.id);
+  }
+  return candidates;
+}
+
 /** Core transform: store oversized tool-result originals and replace their
  *  visible text with placeholders. Pure over its inputs; returns new arrays.
  *  Only shrinks tool-result content in place — message ids, roles, toolCallId
@@ -460,61 +532,11 @@ export function storeLargeResults(
 
   let current = input.store;
   let storedCount = 0;
-  const callById = new Map<string, CoreMessage>();
-  for (const message of input.messages) {
-    if (message.contentType === "tool-call" && message.toolCallId) {
-      callById.set(message.toolCallId, message);
-    }
-  }
-  const protectedCallIds = collectProtectedToolCallIds(
-    input.messages,
-    input.config,
-  );
-  const failedCompressCallIds = collectFailedCompressCallIds(
-    input.messages,
-    input.config,
-  );
-
+  const inspect = createCcrInspector(input, cfg, cfg.storePolicy !== undefined);
   const updated = input.messages.map((message) => {
-    if (message.contentType !== "tool-result") return message;
-    const text = message.text ?? "";
-    if (text.length === 0) return message;
-    const ref = refForRaw(input.state.messageRefs, message.id);
-    // (#1456) strict gate: only a WHOLE-BODY canonical placeholder carrying
-    // this message's own ref skips storage. Ordinary content that merely
-    // mentions the marker (source defining it, docs quoting an example) falls
-    // through to normal storage below.
-    const placeholder = parseStoredPlaceholder(text);
-    if (placeholder && (!ref || placeholder.ref === ref)) return message;
-    if (!message.toolCallId) return message;
-    const toolName = message.toolName;
-    // #5765: opt-in block ops are out of ACP_TOOL_NAMES but still bili-owned
-    // receipts — they bypass ccr storage like every other ACP tool result.
-    if (
-      toolName &&
-      (ACP_TOOL_NAMES.has(toolName) ||
-        BLOCK_OP_TOOL_NAMES.has(toolName) ||
-        toolName === cfg.toolName)
-    ) {
-      return message;
-    }
-    if (
-      toolName &&
-      cfg.excludeTools.some((pattern) => matchToolPattern(toolName, pattern))
-    ) {
-      return message;
-    }
-    if (
-      isMessageProtectedWithPairing(
-        message,
-        input.config,
-        protectedCallIds,
-        failedCompressCallIds,
-      )
-    )
-      return message;
-    if (!ref || ref === BLOCKED_REF) return message;
-    const existing = current.byRef[ref];
+    const result = inspect(message, current, cfg.storePolicy);
+    if (!result) return message;
+    const { ref, call, existing, tokens, text } = result;
     if (existing) {
       return {
         ...message,
@@ -522,19 +544,15 @@ export function storeLargeResults(
           ref,
           existing,
           cfg.toolName,
-          callById.get(message.toolCallId)?.text,
+          call?.text,
           cfg.maxHeadChars,
         ),
       };
     }
-    const tokens = input.countTokens(text);
-    if (tokens < cfg.minToolTokens) return message;
+    const toolName = message.toolName;
     const kind = classifyKind(toolName);
     const head = normalizeHead(text, cfg.maxHeadChars);
-    const command = extractCommand(
-      callById.get(message.toolCallId)?.text,
-      cfg.maxHeadChars,
-    );
+    const command = extractCommand(call?.text, cfg.maxHeadChars);
     current = storeOriginal(current, {
       ref,
       rawId: message.id,

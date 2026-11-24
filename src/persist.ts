@@ -2220,6 +2220,11 @@ export class SessionStore {
         }
     }
 
+    /** Read the view decision from the same session metadata source used on reload. */
+    persistedJevViews(session: Session): Record<string, unknown> | undefined {
+        return this.loadResidentFields(session.id, session.meta, { metadata: true })?.metadata?.jevCcrViews as Record<string, unknown> | undefined;
+    }
+
     /** #3301: stored message decompositions (+ seq±1 neighbors) for
      *  fold-anchor backfill after a wire-shape flip (consumed by
      *  fold-decomposition-lookup → reconcileFoldCoverage.storedMessages).

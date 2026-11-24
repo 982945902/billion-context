@@ -134,6 +134,30 @@ test("an existing prompt_cache_key is never overwritten", () => {
     }));
 });
 
+test("Jev CCR stamps the OMP host session independently of an inherited cache key", () => {
+    withIntercept(true, () => withProxyEnv({ BILLION_CONTEXT_PROXY: PROXY_ORIGIN, BILI_JEV_CCR: "1" }, () => {
+        const ctx = makeCtx("http://10.0.0.8:8199/v1", { api: "openai-completions" });
+        const event = makeEvent({ prompt_cache_key: "parent-key" });
+        const out = stampPromptCacheKey(event, ctx, "omp");
+        assert.equal(out?.prompt_cache_key, "parent-key");
+        assert.equal(out?.biliJevHostSession, "sess-1579");
+    }));
+});
+
+test("opted-in OMP HTTP Responses binds the request owner without manufacturing a provider key", () => {
+    withIntercept(true, () => withProxyEnv({ BILLION_CONTEXT_PROXY: PROXY_ORIGIN, BILI_JEV_CCR: "1" }, () => {
+        const ctx = makeCtx("http://10.0.0.8:8199/relay", { api: "openai-responses" });
+        for (const payload of [{ input: [] }, { input: "hello", prompt_cache_key: "parent-key" }, { previous_response_id: "resp_1" }]) {
+            const event = { payload };
+            assert.deepEqual(stampPromptCacheKey(event, ctx, "omp", "captured-child"), { ...payload, biliJevHostSession: "captured-child" });
+            assert.equal(stampPromptCacheKey(event, ctx, "omp", null), undefined, "a session that appeared after dispatch cannot claim the turn");
+            assert.equal(stampPromptCacheKey(event, ctx, "pi"), undefined);
+            assert.equal(stampPromptCacheKey(event, makeCtx("http://10.0.0.8:8199/v1", { api: "openai-codex-responses" }), "omp"), undefined);
+            withProxyEnv({ BILI_JEV_CCR: undefined }, () => assert.equal(stampPromptCacheKey(event, ctx, "omp"), undefined));
+        }
+    }));
+});
+
 test("a body without messages array is left alone", () => {
     withIntercept(true, () => withEnv(PROXY_ORIGIN, () => {
         const out = stampPromptCacheKey({ payload: { foo: 1 } }, makeCtx("http://10.0.0.8:8199/v1"), "omp");

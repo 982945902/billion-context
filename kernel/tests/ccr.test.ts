@@ -30,6 +30,7 @@ import {
   type StoredPlaceholderInput,
 } from "../src/ccr.js";
 import { createCore } from "../src/compress.js";
+import { collectCcrCandidates } from "../src/index.js";
 import { coreToOpenai } from "../src/wire/openai.js";
 import { coreToResponses } from "../src/wire/responses.js";
 import { createInitialState } from "../src/state.js";
@@ -733,6 +734,54 @@ test("processTurn with CCR: stores at arrival, replaces with placeholder, bumps 
   const found = retrieveByRef(result.contentStore, "m00004");
   assert.ok(found.ok);
   if (found.ok) assert.equal(found.text, original);
+});
+
+test("CCR preflight authorizes individual arrivals, skips old full results, and leaves input state untouched", () => {
+  const core = createCore({ countTokens });
+  const messages = [
+    ...sessionWithBigBash(),
+    toolCall("c2", "call2"), toolResult("r2", "call2"),
+    toolCall("c3", "call3"), toolResult("small", "call3", "bash", "short"),
+    toolCall("c4", "call4", "acp_retrieve"), { ...toolResult("receipt", "call4"), toolName: undefined },
+    toolCall("c5", "call5", "secret_read"), { ...toolResult("excluded", "call5"), toolName: undefined },
+  ];
+  const config = ccrConfig({ excludeTools: ["secret_*"], storePolicy: new Set(["r2", "small", "receipt", "excluded"]) });
+  const state = createInitialState();
+  const store = createContentStore();
+  const input = { messages, state, config, store, countTokens };
+  const candidates = collectCcrCandidates(input);
+  assert.deepEqual(candidates.map(({ message, call, tokens }) => [message.id, call?.id, tokens]), [
+    ["r1", "c1", countTokens(bigText())], ["r2", "c2", countTokens(bigText())],
+  ]);
+  assert.deepEqual(state, createInitialState());
+  assert.deepEqual(store, createContentStore());
+  const turn = core.processTurn({ ...input, contentStore: store, tokenCount: 1000, renderTags: "none" });
+  assert.deepEqual(Object.values(turn.contentStore.byRef).map((entry) => entry.rawId), ["r2"]);
+  assert.equal(turn.messages.find((m) => m.id === "r1")?.text, bigText());
+  assert.deepEqual(collectCcrCandidates({ ...input, state: turn.state, store: turn.contentStore }), []);
+});
+
+test("verified replay requires matching archive identity even across a persisted view latch", () => {
+  const core = createCore({ countTokens });
+  const messages = sessionWithBigBash();
+  const seed = core.processTurn({
+    messages, state: createInitialState(), tokenCount: 1000, renderTags: "none",
+    config: ccrConfig({ storePolicy: new Set(["r1"]), replayPolicy: new Set() }),
+  });
+  const ref = refForRaw(seed.state.messageRefs, "r1")!;
+  const entry = seed.contentStore.byRef[ref]!;
+  const placeholder = seed.messages[3]!.text!;
+  assert.equal(parseStoredPlaceholder(placeholder)?.ref, ref);
+  const replay = (allowed: ReadonlySet<string>, contentStore = seed.contentStore) => core.processTurn({
+    messages, state: seed.state, contentStore, tokenCount: 1000, renderTags: "none",
+    config: ccrConfig({ storePolicy: new Set(), replayPolicy: allowed }),
+  });
+  assert.equal(replay(new Set(["r1"])).messages[3]!.text, placeholder);
+  assert.equal(replay(new Set()).messages[3]!.text, bigText());
+  assert.equal(replay(new Set(["r1"]), createContentStore()).messages[3]!.text, bigText());
+  assert.equal(replay(new Set(["r1"]), {
+    ...seed.contentStore, byRef: { [ref]: { ...entry, rawId: "other-result" } },
+  }).messages[3]!.text, bigText());
 });
 
 test("processTurn is byte-stable across turns after replacement", () => {

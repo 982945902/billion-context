@@ -22,7 +22,7 @@ import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { absorbAbortedTurnGrowth, nudgeStampsOf, restoreNudgeStamps, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, nudgeStampsOf, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, type PendingRetrieval, type Session } from "../session.js";
 import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
@@ -31,7 +31,8 @@ import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, ab
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { buildBlockOpsSystemPrompt } from "acp-kernel";
-import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
+import { ccrEnabled, ccrLoopConfig, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
+import { jevCcrActive } from "../jev-ccr.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -43,7 +44,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
-import { SessionStore } from "../persist.js";
+import { processPreparedCcrTurn } from "./prepare-ccr-turn.js";
 import { FoundationRejectError } from "../snapshot/plane.js";
 import { runStage0 } from "../snapshot/stage0.js";
 import { applyImageRescalePass } from "../image-rescale.js";
@@ -134,6 +135,8 @@ export async function prepareOpenai(
     const incomingSeqsRaw = incomingSeqsOf(parsed);
     delete parsed[MSG_SEQS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as Record<string, unknown>).biliJevHostSession;
+    const jev = pluginMode && ccrEnabled(session) && jevCcrActive(session);
     // #7064 §8: the INCREMENTAL pin reuses the watermark's bounded tail-ids
     // header — the same bytes that ride the wire for the hit verdict pin the
     // prefix when the full list is absent. Three-state handoff to stage 0
@@ -223,7 +226,7 @@ export async function prepareOpenai(
     let wpOutcome: FastpathOutcome | null = null;
     let wpFullText: string | undefined;
     const wpModel = typeof parsed.model === "string" ? parsed.model : "";
-    if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
+    if (!jev && bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
         wpFullText = bodyText;
         // Delta arm first: a delta claim is EXCLUSIVE — the body carries only
         // the tail slice, so the full-body lane cannot evaluate it at all. A
@@ -364,7 +367,7 @@ export async function prepareOpenai(
         // Bootstrap: an armed turn with an EMPTY flow is the turn-1 cold start
         // the ruling allows — the client bytes enter the flow exactly once
         // (the record below), from turn 2 the log is the content source.
-        egressArmed = egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: isTitleGen });
+        egressArmed = !jev && egressAuthorityArmed({ pluginMode, pinned: s0.pinned !== null, sideRequest: isTitleGen });
         if (egressArmed) {
             // The single shared authority seam (egress-lane-io): latch,
             // recover, hard-fail, bootstrap / swap / legacy — one code path
@@ -390,7 +393,7 @@ export async function prepareOpenai(
         // re-mints #3752); only the live tail keeps the client's bytes.
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        const renderMsgs = jev ? msgs : maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
 
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
@@ -513,11 +516,6 @@ export async function prepareOpenai(
         // nudge-carrying request rolls the cadence back to pre-turn (lane
         // mirror of the anthropic-lane fix).
         nudgeStampsBefore = nudgeStampsOf(session);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
-        session.state = turn.state;
-        const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
-        if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
-        adoptContentStore(session, turn.contentStore);
         // In-request ledger flush: the transcript up to THIS user message is
         // durable before the model call (#3397 durability-before-render) and
         // the stage-0 envelope / M2 evidence read a current ledger.
@@ -542,7 +540,6 @@ export async function prepareOpenai(
             wpHit !== undefined && s0.pinned !== null && s0.pinned.length === wpHit.totalT
                 ? s0.pinned.slice(s0.pinned.length - wpHit.windowCores.length)
                 : wpHit?.windowCores;
-        snapshotMessages(session, ledgerWindow ?? originalMessages);
         // #7064 ledger drain: on a watermark-HIT turn that snapshot is the
         // ~2-row tail WINDOW — a verified suffix of the ledger (head check +
         // pf-seq vouch for the prefix), NOT the complete log. Claiming rawness
@@ -557,8 +554,10 @@ export async function prepareOpenai(
         // (KDD#21 水位线以下存活行). Every consumer of the flag already treats
         // "pruned view, not raw log" as the skip-sweep / skip-append contract
         // (persist tail selection, ingest tail_json, handoff stash, export).
-        if (wpHit !== undefined) session.lastMessagesFolded = true;
-        snapFlush = await SessionStore.flushOrSkip(session);
+        const { turn, nudgeHeldAfterReject, flush } = await processPreparedCcrTurn(core, session,
+            { messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy },
+            jev, ledgerWindow ?? originalMessages, wpHit !== undefined, nudgeStampsBefore, log);
+        snapFlush = flush;
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -695,7 +694,7 @@ export async function prepareOpenai(
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         if (blockOpsActive) sysParts.push(buildBlockOpsSystemPrompt("function"));
         openaiOutboundSystem = sysParts.join("\n\n");
-        if (!isTitleGen && featureEnabled("egressPlane") && !(egressArmed && !egressSwapApplied)) {
+        if (!jev && !isTitleGen && featureEnabled("egressPlane") && !(egressArmed && !egressSwapApplied)) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 try {
@@ -953,7 +952,7 @@ export async function prepareOpenai(
     // empty flow records the client view ONCE — that is the cold start, not
     // "untrusted bytes advancing the flow" (there is no flow to advance
     // against; from turn 2 the armed gate is fully enforced again).
-    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog && !(egressArmed && !egressSwapApplied && !egressBootstrap)) {
+    if (!jev && !isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog && !(egressArmed && !egressSwapApplied && !egressBootstrap)) {
         try {
             const st = getStore().egressOpLogStore();
             if (st) {
@@ -981,7 +980,7 @@ export async function prepareOpenai(
     // identity rate the swap will rely on (rollout egressPlane, default 0;
     // reads the hydrated flow view — on a bootstrap turn that is the view
     // the record above just wrote, i.e. an exact self-compare).
-    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog) {
+    if (!jev && !isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog) {
         try {
             const st = getStore().egressOpLogStore();
             const view = egressBaseRows ?? (st ? st.egressStateView(sessionId) : undefined);

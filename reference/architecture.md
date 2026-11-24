@@ -26,6 +26,7 @@ billion-context/
 │   │   ├── observability.ts      #   Body dumps (dumps/req-*.json, raw/*), unrecognized-path stats
 │   │   ├── prepare-anthropic.ts  #   Anthropic request preparation (fold → rebuild → system/nudge injection) (#1440)
 │   │   ├── prepare-google.ts     #   Gemini request preparation incl. :countTokens twin (#1440)
+│   │   ├── prepare-ccr-turn.ts   #   Apply first-view decisions and verify durable originals before returning placeholders
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
@@ -124,6 +125,8 @@ billion-context/
 │   │   ├── status-body.ts        #   Inbound acp_status report-body stripping (#2789)
 │   ├── chain-checkpoint.ts       # Chain-checkpoint digest match / stale verdict split (#1421)
 │   ├── store.ts                  # Content retrieval store (CCR) + per-request policy stamping
+│   ├── jev-ccr.ts                # OMP first-view decisions and verification of persisted originals
+│   ├── jev-judge.ts              # Batch CCR decisions via the configured System One endpoint
 │   ├── rules-feature.ts          # Model-owned session rules opt-in (#1399)
 │   ├── system-anchor.ts          # Stable system anchor fingerprint (volatile-head guard)
 │   ├── subagent-sessions.ts      # opencode sub-agent dispatch session keying (#1702)

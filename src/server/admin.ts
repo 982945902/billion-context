@@ -525,7 +525,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // tool descriptions follow the top-level promptPack while per-request system prompts
         // may still honor deeper provider/model levels.
         const packSurface = resolveCompressSurfaceDetailed(opts.compress ?? {});
-        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }), packSurface.surface.toolPrompts);
+        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }), packSurface.surface.toolPrompts, opts.compress.ccr?.jevTrial);
     }
     if (req.method === "GET" && req.url?.split("?")[0] === "/__bili/plugin/snapshot") {
         return await handlePluginSnapshot(new URL(req.url, "http://localhost").searchParams.get("conversationId") ?? "", res);

@@ -497,7 +497,7 @@ function noteOmpCoworkBypass(modelId: string): void {
 // permitted") 400 the whole request. Unrouted destinations degrade to the
 // proxy's anonymous prefix-affinity sessions (#309): compression still works,
 // /acp lookup by session id does not — acceptable vs a guaranteed 400.
-export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Record<string, unknown> | undefined {
+export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string, requestOwner?: string | null): Record<string, unknown> | undefined {
     // #3482 site 3: the identity-stamp CHANNEL is a registry property — omp
     // stamps the body pck, pi stamps x-bili-plugin-conversation in
     // before_provider_headers (which outranks the body field). No adapter-side
@@ -525,13 +525,24 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
     const payload = (event as { payload?: unknown } | undefined)?.payload;
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
     const p = payload as Record<string, unknown>;
+    if (agent === "omp" && process.env.BILI_JEV_CCR === "1" && ctx.model?.api === "openai-responses"
+        && (p.input !== undefined || p.previous_response_id !== undefined || p.conversation !== undefined)) {
+        // A provider cache key is neither required nor proof of who runs a
+        // retrieve. In particular a fork may keep the parent's key.
+        const owner = requestOwner === undefined ? sessionIdOf(ctx) : requestOwner;
+        return owner ? { ...p, biliJevHostSession: owner } : undefined;
+    }
     if (!Array.isArray(p.messages)) return undefined;
     if (p.input !== undefined) return undefined;
-    if (typeof p.prompt_cache_key === "string" && p.prompt_cache_key.trim().length > 0) return undefined;
+    const hostKey = typeof p.prompt_cache_key === "string" && p.prompt_cache_key.trim().length > 0;
+    const jev = process.env.BILI_JEV_CCR === "1" && ctx.model?.api === "openai-completions";
+    if (hostKey && !jev) return undefined;
     const sid = sessionIdOf(ctx);
-    if (sid === undefined || sid.length === 0) return undefined;
-    rememberStampedPromptCacheKey(sid);
-    return { ...p, prompt_cache_key: sid };
+    if (!sid) return undefined;
+    if (!hostKey) rememberStampedPromptCacheKey(sid);
+    // A fork may inherit the parent's provider cache key. Carry the actual
+    // owner separately so the proxy can prove where acp_retrieve will run.
+    return { ...p, ...(!hostKey ? { prompt_cache_key: sid } : {}), ...(jev ? { biliJevHostSession: sid } : {}) };
 }
 
 // #6525: single source of truth for "the proxy will see this request's
@@ -573,6 +584,11 @@ function bodyProxyVisible(ctx: Ctx, agent: string): boolean {
     if (!nativeInterceptInstalled()) return false;
     if (detectProxyBase(ctx.model?.baseUrl) === undefined) return false;
     const base = ctx.model?.baseUrl ?? "";
+    if (agent === "omp" && process.env.BILI_JEV_CCR === "1" && ctx.model?.api === "openai-responses") {
+        // The HTTP Responses SDK appends /responses to the configured
+        // provider base, which need not end in /v1 (e.g. a custom relay).
+        return isModelApiUrl(base) || isModelApiUrl(`${base.replace(/\/+$/, "")}/responses`);
+    }
     const expanded = /\/v\d+\/?$/.test(base) ? `${base.replace(/\/+$/, "")}/chat/completions` : base;
     return isModelApiUrl(base) || isModelApiUrl(expanded);
 }
@@ -678,9 +694,19 @@ function withoutStampedPromptCacheKey(text: string): string | undefined {
         return undefined;
     }
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-    const { prompt_cache_key: key, ...rest } = parsed as Record<string, unknown>;
-    if (typeof key !== "string" || !stampedPromptCacheKeys.has(key)) return undefined;
-    return JSON.stringify(rest);
+    const body = parsed as Record<string, unknown>;
+    // Responses never synthesize a cache key, even if the provider key
+    // equals one previously synthesized on a Chat turn in this process.
+    const responses = "biliJevHostSession" in body && (body.input !== undefined || body.previous_response_id !== undefined || body.conversation !== undefined);
+    const stampedKey = !responses && typeof body.prompt_cache_key === "string" && stampedPromptCacheKeys.has(body.prompt_cache_key);
+    if (!stampedKey && !("biliJevHostSession" in body)) return undefined;
+    if (stampedKey) delete body.prompt_cache_key;
+    if (responses) {
+        delete body.biliMsgIds;
+        delete body.biliLedgerSeqs;
+    }
+    delete body.biliJevHostSession;
+    return JSON.stringify(body);
 }
 
 function fmtTok(n: number): string {
@@ -1809,6 +1835,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: payload, msgIds: forkMsgIds });
         }
         pi.on("before_provider_request", async (event, ctx) => {
+            // Registration below can await while the host changes sessions.
+            // Bind the Responses payload to its owner at event delivery.
+            const responseTrial = agent === "omp" && process.env.BILI_JEV_CCR === "1" && ctx.model?.api === "openai-responses";
+            const requestModelCtx = responseTrial ? { model: ctx.model } : ctx;
+            const requestOwner = responseTrial ? sessionIdOf(ctx) ?? null : null;
             // #5403/#5418 unified watermark channel: capture THIS request's
             // host msgids per family for the ONE chokepoint emitter. Runs on
             // EVERY model request — including the OpenAI-family turns the
@@ -1878,7 +1909,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // the window), so it rides the same awaited pre-send slot — after
             // registerTools (plugin claim) but before the payload returns.
             try {
-                await maybeAdoptForkChild(event, ctx);
+                if (!responseTrial || requestOwner === sessionIdOf(ctx)) await maybeAdoptForkChild(event, ctx);
             } catch (err) {
                 logHostEvent("error", "[native-client]", `bili-plugin(${agent}): fork adoption failed (${err instanceof Error ? err.message : String(err)}) — starting the session fresh (#2399)`);
             }
@@ -1901,7 +1932,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // the pck stamp when it fired (base = pck-stamped payload for
             // omp, original payload for pi) and returns undefined to leave
             // the request byte-identical when the envelope can't be stamped.
-            const pck = stampPromptCacheKey(event, ctx, agent);
+            const pck = stampPromptCacheKey(event, requestModelCtx, agent, requestOwner);
+            if (responseTrial && requestOwner !== sessionIdOf(ctx)) return pck;
             return stampMsgIdEnvelope(event, ctx, agent, pck) ?? pck;
         });
         // #3248 incremental turns: the ack channel. after_provider_response

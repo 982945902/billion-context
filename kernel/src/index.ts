@@ -1,5 +1,5 @@
 export * from "./types.js";
-export { createCore } from "./compress.js";
+export { collectCcrCandidates, createCore } from "./compress.js";
 export type {
   Ports,
   CompressionCore,
@@ -216,6 +216,7 @@ export {
   ccrStoreNode,
 } from "./ccr.js";
 export type {
+  CcrCandidate,
   StoredPlaceholderInput,
   ParsedStoredPlaceholder,
   RetrievalExport,

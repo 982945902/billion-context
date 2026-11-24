@@ -14,7 +14,7 @@ import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
-import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
+import { bindJevResponsesProjection, mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
@@ -25,7 +25,7 @@ import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgSeq
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, nudgeStampsOf, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, restoreNudgeStamps, snapshotMessages, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, nudgeStampsOf, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -33,6 +33,8 @@ import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_
 import { blockOpsEnabled, storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
+import { processPreparedCcrTurn } from "./prepare-ccr-turn.js";
+import { rememberFullJevView } from "../jev-ccr.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -49,7 +51,7 @@ import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
-import { SessionStore, getStore } from "../persist.js";
+import { getStore } from "../persist.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
@@ -75,6 +77,8 @@ export async function prepareResponses(
     visibilityMarkers: boolean,
     billingUpstream?: string,
     decide?: DecideConfig,
+    jevResponsesArmed = false,
+    ompJevRequest = false,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const inboundMessageCount = Array.isArray(parsed.input) ? parsed.input.length : 1;
@@ -295,10 +299,12 @@ export async function prepareResponses(
             pluginMode,
             log,
         });
+        if (ompJevRequest) bindJevResponsesProjection(projection, s0.pinned);
         if (s0.pinned !== null) {
             msgs = s0.pinned;
             originalMessages = msgs;
         }
+        if (ompJevRequest && !jevResponsesArmed) rememberFullJevView(session, originalMessages);
         // #7064 D3 (尾锚常活): the stage-0 cursor may have advanced BEFORE
         // processTurn — bump the session revision so the per-turn snapshot
         // flush below (snapFlush epoch proof) observes the advance. A fork
@@ -338,7 +344,7 @@ export async function prepareResponses(
             noteAnchoredRender(session, log);
             renderMsgs = anchored.view;
         } else {
-            renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+            renderMsgs = ompJevRequest ? msgs : maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
         }
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
@@ -359,7 +365,8 @@ export async function prepareResponses(
         const blockOps = blockOpsTools();
         const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && shouldInject && !isCompactionTrigger;
         const rulesActive = rulesEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
-        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        const turnConfig = { ...config, absorb: absorbActive ? absorbBlock : undefined };
+        const loopConfig = ompJevRequest && !jevResponsesArmed ? { ...turnConfig, ccr: undefined } : ccrLoopConfig(session, turnConfig);
         // #2372/#2432: LOCAL auto-compaction — the client compacts on its own
         // and the call never transits the proxy; the first the proxy hears of
         // it is this request replaying [compaction summary, retained tail…].
@@ -447,19 +454,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // nudge-carrying request rolls the cadence back to pre-turn (lane
         // mirror of the anthropic-lane fix).
         nudgeStampsBefore = nudgeStampsOf(session);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags, contentStore: contentStoreOf(session) });
-        session.state = turn.state;
-        const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
-        if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
-        adoptContentStore(session, turn.contentStore);
-        // In-request ledger flush: the transcript up to THIS user message is
-        // durable before the model call (#3397 durability-before-render) and
-        // the stage-0 envelope / M2 evidence read a current ledger.
-        // snapshotMessages first: the persist build reads session.lastMessages
-        // — and it stays the RAW client resend (never the D-lane view: its
-        // synthetic acp_summary anchor is not a transcript message).
-        snapshotMessages(session, originalMessages);
-        snapFlush = await SessionStore.flushOrSkip(session);
+        const { turn, nudgeHeldAfterReject, flush } = await processPreparedCcrTurn(core, session,
+            { messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags },
+            jevResponsesArmed, originalMessages, false, nudgeStampsBefore, log);
+        snapFlush = flush;
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -549,7 +547,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // (egressAuthorityArmed — same as the OpenAI lane). Every other main
         // turn is only recorded.
         const egressSide = isCompactionTrigger || egressTinyBudget(parsed);
-        if (!egressSide && featureEnabled("egressPlane")) {
+        if (!ompJevRequest && !egressSide && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 // The single shared authority seam (egress-lane-io),
@@ -710,6 +708,13 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // (it throws before processTurn).
         if (err instanceof FoundationRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
+        if (ompJevRequest) {
+            // A failure after the preliminary wire rebuild must not forward
+            // that partially transformed object or latch it for the retry.
+            rebuiltInput = parsed.input;
+            toolsOut = parsed.tools;
+            rememberFullJevView(session, originalMessages);
+        }
         processedMessages = [];
     }
 
@@ -761,21 +766,13 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     if (!isCompactionTrigger) {
         clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "responses", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     }
-    // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
-    // is first-wins and would keep injecting pck toward a relay we switched
-    // away from (same class of bug as the compressProtocol fix above, #286).
-    const promptCacheKey = resolvePromptCacheKey(
-        rebuilt.prompt_cache_key,
-        identity,
-        effectivePromptCacheRouting(opts.promptCache),
-        upstreamOrigin,
-        sessionId,
-    );
-    if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
-    // #3813: mirror the OpenAI lane's #2645 ablation consult — once an egress
-    // origin+model is A/B-confirmed to reject prompt_cache_key, drop it here too
-    // (client-supplied or injected) so each turn stops re-paying a 400 + retry.
-    if (pckKeyAbated(billingUpstream, upstreamOrigin, modelIdOf(parsed))) delete rebuilt.prompt_cache_key;
+    // For opted-in OMP traffic the provider owns the cache key (including
+    // its absence). The archive owner may be a fork sharing a parent's key.
+    if (!ompJevRequest) {
+        const promptCacheKey = resolvePromptCacheKey(rebuilt.prompt_cache_key, identity, effectivePromptCacheRouting(opts.promptCache), upstreamOrigin, sessionId);
+        if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
+        if (pckKeyAbated(billingUpstream, upstreamOrigin, modelIdOf(parsed))) delete rebuilt.prompt_cache_key;
+    }
     // This adapter is stateless: we replay the FULL conversation in `input`.
     // Strip Responses' native chaining field so the upstream does not resolve
     // stored server-side state ON TOP of the input we already sent (which would
@@ -794,7 +791,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         if (chainWarn) log("warn", `[${sessionId}] ${chainWarn}`);
         delete rebuilt.previous_response_id;
     }
-    delete rebuilt.instructions;
+    if (!ompJevRequest || transformOk) delete rebuilt.instructions;
     // Same rationale as prepareOpenai: strip the OpenAI-host-only cache
     // directive; keep prompt_cache_key. Sent by hermes' codex transport and
     // by any PI_CACHE_RETENTION=long client.

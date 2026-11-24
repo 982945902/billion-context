@@ -290,6 +290,9 @@ export interface CrushConfig {
   strategies?: Record<string, CrushStrategyOverride>;
 }
 
+/** Raw tool-result message IDs authorized by the host for this turn. */
+export type CcrStorePolicy = ReadonlySet<string>;
+
 export interface CcrConfig {
   enabled: boolean;
   /** Model-facing retrieve tool name (adapters may rename, e.g. acp_retrieve). */
@@ -298,6 +301,12 @@ export interface CcrConfig {
   minToolTokens: number;
   /** Tool-name patterns (glob suffix allowed) never CCR-stored, independent of protectedTools. */
   excludeTools: string[];
+  /** Runtime-only host decision. An empty set permits replay only. Omit to
+   *  store all eligible results under the ordinary size policy. */
+  storePolicy?: CcrStorePolicy;
+  /** If supplied, replay requires a matching stored raw ID authorized by
+   *  the host as durably retrievable. Omit for ordinary by-ref replay. */
+  replayPolicy?: CcrStorePolicy;
   /** Max characters for the placeholder's head/command preview. */
   maxHeadChars: number;
   /** Retrieved originals below this many tokens are inlined into the

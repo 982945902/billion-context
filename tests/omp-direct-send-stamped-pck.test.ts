@@ -54,6 +54,16 @@ test("direct send keeps a prompt_cache_key the plugin did not stamp", async () =
     assert.equal(prep.outcome, "as-is");
 });
 
+test("direct Responses strips request-private fields but preserves a provider key also used by Chat", async () => {
+    stampedBody("overlapping-provider-key");
+    const plain = { input: [{ role: "user", content: "biliJevHostSession is ordinary message text" }], prompt_cache_key: "overlapping-provider-key" };
+    const body = { ...plain, biliJevHostSession: "actual-child", biliMsgIds: ["m1"], biliLedgerSeqs: [1] };
+    const url = "http://127.0.0.1:8199/v1/responses";
+    const prep = await createOmpDirectSendGuard()(url, new Request(url, { method: "POST", body: JSON.stringify(body) }), undefined);
+    assert.equal(prep.outcome, "restored");
+    if (prep.outcome === "restored") assert.deepEqual(JSON.parse(prep.body), plain);
+});
+
 test("direct send leaves a body without prompt_cache_key untouched", async () => {
     const plain = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] });
     const prep = await createOmpDirectSendGuard()(URL_MESSAGES, URL_MESSAGES, { method: "POST", body: plain });

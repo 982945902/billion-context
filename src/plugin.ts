@@ -1,4 +1,4 @@
-import { ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME, BLOCKED_REF, BLOCK_OP_TOOL_NAMES, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME, BLOCKED_REF, BLOCK_OP_TOOL_NAMES, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type ToolPrompts, applyAcpToolOverrides, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -1107,7 +1107,7 @@ export function handlePluginSessionName(payload: string, res: import("node:http"
 // arbitration; see tool-ring.ts). Wire-mode injection serves the kernel
 // constants directly, which never carried the param.
 
-export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config, toolPrompts?: ToolPrompts): void {
+export function handlePluginManifest(res: ServerResponse, config: Config, toolPrompts?: ToolPrompts, jevTrial = false): void {
     // #1192: hosts register whatever the manifest serves verbatim (pi/omp/dsh/
     // opencode native plugins, MCP shims), so advertising an opt-in tool this
     // proxy's config leaves disabled guarantees a rejected call the moment the
@@ -1132,13 +1132,13 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     const blockOpsOn = blockOpsEnabled(config);
     const blockOps = blockOpsOn ? blockOpsTools() : undefined;
     const rulesOn = rulesEnabled(config);
-    // [#1271] acp_retrieve is advertised only while the base config enables CCR (same
-    // #1192 conservative rule as absorb/acp_rule). The proxy wires it on the anthropic/
-    // openai lanes in plugin mode; the responses wire is deliberately NOT advertised —
-    // that proxy disarms CCR there, so advertising would break #1192.
+    // Native retrieval returns the original (or exported-file pointer) in
+    // the tool result. Responses advertises it only on a Jev trial listener;
+    // ownership and presence of that native function are proved per request.
     const ccrOn = config.ccr?.enabled === true;
     const ccrName = config.ccr?.toolName ?? RETRIEVE_TOOL_NAME;
     const ccrTools = ccrOn ? retrieveToolsFor(ccrName) : undefined;
+    const responsesRetrieve = ccrTools && (jevTrial || process.env.BILI_JEV_CCR === "1");
     // #3400: acp_read_original_image restores the full-resolution original of a
     // downscaled image from local session storage. Same conservative #1192
     // rule as acp_retrieve: advertised only while the base knob enables the
@@ -1161,10 +1161,8 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // stock descriptions where a promptPack declares its own.
     const acpAnthropic = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalSummary), "binding");
     const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalSummary), "binding");
-    // Responses wire: plugin mode structurally disarms CCR there (#1271 —
-    // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
-    // registered agent on that wire — always the no-range variant, mirroring
-    // how ccrTools above is never spread into the responses array.
+    // Jev retrieval needs no queued history injection. Range decompress does;
+    // keep the no-range Responses schema on both paths.
     const acpResponses = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, toolPrompts), externalSummary), "binding");
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
@@ -1177,7 +1175,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         tools: {
             anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL] : []), ...(blockOps ? blockOps.anthropic : [])],
             openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOps ? blockOps.openai : [])],
-            responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : []), ...(blockOps ? blockOps.responses : [])],
+            responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(responsesRetrieve ? [ccrTools.responses] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : []), ...(blockOps ? blockOps.responses : [])],
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER, compression: PLUGIN_COMPRESSION_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -2560,7 +2558,6 @@ export async function handlePluginTool(
     const callId = typeof parsed.toolCallId === "string" ? parsed.toolCallId : `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
     acquireInFlight(session);
     let result: ProxyToolResult | undefined;
-    let retrievalExport: RetrievalExport | undefined;
     try {
         result = await withSessionLock(session, async () => {
             if (parsed.expectedRevision !== undefined) {
@@ -2600,11 +2597,6 @@ export async function handlePluginTool(
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
-            if (nativeCaller && tool === retrieveToolName(session) && typeof args.ref === "string") {
-                // Preserve the session's export before a same-ref concurrent lookup.
-                const retrieved = applyRetrieve({ store: contentStoreOf(session), ref: args.ref, exportDir: path.join(stateDir(), "retrieve") });
-                if (retrieved.ok && retrieved.toolResultText === toolResult.text) retrievalExport = retrieved.export;
-            }
             const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;
             const restoredInjections = session.pendingRetrievals.filter((p) => !pendingBefore.has(p.ref));
             // The string tool protocol has distinct success headers for whole/derived and range restores.
@@ -2651,7 +2643,7 @@ export async function handlePluginTool(
     if (result.outcome !== undefined) body.outcome = result.outcome;
     if (result.blocksCreated !== undefined) body.blocksCreated = result.blocksCreated;
     body.result = sentResult;
-    if (retrievalExport !== undefined) body.retrievalExport = retrievalExport;
+    if (nativeCaller && result.retrievalExport) body.retrievalExport = result.retrievalExport;
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(body));
 }
