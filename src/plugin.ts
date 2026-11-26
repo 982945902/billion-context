@@ -27,6 +27,7 @@ import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./s
 import { formatProtectedMass, uncoveredAudit, type ProtectedMassLedger } from "./uncovered.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
+import { classifyUpstreamFailure } from "./upstream-fail.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
 import type { HandoffReply } from "./server/handoff-response.js";
 import { captureHandoffJson, HANDOFF_REPLY_MAX_BYTES } from "./server/handoff-response.js";
@@ -2888,6 +2889,7 @@ export async function pipePluginChatWithStrip(
     // own budget — the proxy must not spend a second one.
     hostOwnsTruncationRecovery = false,
 ): Promise<void> {
+    const transparentCut = (hostOwnsTruncationRecovery && protocol === "openai") || transparentTruncationApplies(session);
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
     let buf = "";
@@ -3948,14 +3950,16 @@ export async function pipePluginChatWithStrip(
     try {
         let pendingFinal: string | null = null;
         for (;;) {
-            // #5951: a cut arrives as a failed read as often as a clean EOF. The
-            // same replay owns both, and anything the client can act on rethrows
-            // into the #721 truncation signal below.
-            let step: Awaited<ReturnType<(typeof reader)["read"]>>;
+            // A socket reset after headers can cut the same empty stream as EOF.
+            // Keep the existing reasoning-only path and the host's retry ownership.
+            let step: ReadableStreamReadResult<Uint8Array>;
             try {
                 step = await reader.read();
             } catch (e) {
-                if (!hostOwnsTruncationRecovery && await retryReasoningOnlyCut(e)) continue;
+                if (!hostOwnsTruncationRecovery) {
+                    if (!sawTerminal && classifyUpstreamFailure(e) === "upstream-reset" && await retryZeroByteCut()) continue;
+                    if (await retryReasoningOnlyCut(e)) continue;
+                }
                 throw e;
             }
             const { done, value } = step;
@@ -4114,11 +4118,9 @@ export async function pipePluginChatWithStrip(
         if (truncated) {
             reply?.discard();
             // #721 → #2563: the client still owns the stream from here.
-            // Permitlist hosts (pi) get the raw cut — their native layer
-            // classifies it as transient and retries; everyone else gets the
-            // in-band truncation signal.
+            // Hosts with native cut recovery need the raw EOF, not a synthetic error.
             if (session) noteTruncatedUpstream(session, protocol, "eof");
-            emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("eof"), transparentTruncationApplies(session));
+            emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("eof"), transparentCut);
             return;
         }
     } catch (e) {
@@ -4149,7 +4151,7 @@ export async function pipePluginChatWithStrip(
         }
         loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — truncation signal path`);
         if (session) noteTruncatedUpstream(session, protocol, "read-error");
-        emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("read-error", e), transparentTruncationApplies(session));
+        emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("read-error", e), transparentCut);
         return;
     } finally {
         reader.releaseLock();
@@ -4463,6 +4465,7 @@ export async function pipePluginResponsesWithStrip(
     reply?: HandoffReply,
     hostOwnsTruncationRecovery = false,
 ): Promise<void> {
+    const transparentCut = hostOwnsTruncationRecovery || transparentTruncationApplies(session);
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
     let buf = "";
@@ -4931,7 +4934,14 @@ export async function pipePluginResponsesWithStrip(
     try {
         let pendingFinal: string | null = null;
         for (;;) {
-            const { done, value } = await reader.read();
+            let step: ReadableStreamReadResult<Uint8Array>;
+            try {
+                step = await reader.read();
+            } catch (e) {
+                if (!hostOwnsTruncationRecovery && !sawTerminal && classifyUpstreamFailure(e) === "upstream-reset" && await retryZeroByteCut()) continue;
+                throw e;
+            }
+            const { done, value } = step;
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
@@ -5202,11 +5212,10 @@ export async function pipePluginResponsesWithStrip(
         // Same rule as the chat pipe: upstream completion decides, not the socket.
         if (replyCompleted) reply?.save();
         // #721 → #2563: never leave the stream hanging on a missing done-family
-        // event. Permitlist hosts (pi) get the raw cut for their native
-        // classifier; everyone else gets the in-band error frame.
+        // event. Hosts with native cut recovery get the raw EOF.
         if (!sawTerminal && !res.destroyed && !res.writableEnded) {
             if (session) noteTruncatedUpstream(session, "responses", "eof");
-            emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("eof"), transparentTruncationApplies(session));
+            emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("eof"), transparentCut);
             return;
         }
     } catch (e) {
@@ -5233,7 +5242,7 @@ export async function pipePluginResponsesWithStrip(
         }
         loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — truncation signal path`);
         if (session) noteTruncatedUpstream(session, "responses", "read-error");
-        emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("read-error", e), transparentTruncationApplies(session));
+        emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("read-error", e), transparentCut);
         return;
     } finally {
         reader.releaseLock();
