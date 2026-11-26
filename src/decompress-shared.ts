@@ -1,6 +1,7 @@
 import {
     blockDocs,
     collectBlockContent,
+    docFeatures,
     markBlockRestoredInline,
     matchToolMessagePattern,
     parseBoundary,
@@ -24,7 +25,8 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { blockContentSnapshot, markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
 import { getStore } from "./persist.js";
-import { ccrEnabled, contentStoreOf } from "./store.js";
+import { ccrEnabled, contentStoreOf, retrieveToolName } from "./store.js";
+import { jevCcrActive } from "./jev-ccr.js";
 import { safePrefix } from "./text-safe.js";
 import { decompressTmpCap as knobDecompressTmpCap } from "./knobs.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -843,6 +845,42 @@ function originalTextsOf(session: Session): OriginalTextProvider {
     };
 }
 
+/** Rank bounded excerpts so large logs do not fill the kernel's token cache.
+ * The excerpt may come from anywhere in the original, even past its head. */
+function archiveSearchDocs(session: Session, query: string, terms: string[]): SearchDoc[] {
+    const store = contentStoreOf(session);
+    const needles = new Set([...terms, ...docFeatures(query).tf.keys()]);
+    const docs: SearchDoc[] = [];
+    for (const ref of Object.keys(store.byRef)) {
+        const original = retrieveByRef(store, ref);
+        if (!original.ok) continue;
+        const { text, entry } = original;
+        const title = safePrefix(entry.command ?? entry.toolName ?? entry.kind, SNIPPET_TOTAL);
+        let excerpt = text;
+        if (text.length > SNIPPET_TOTAL * 2) {
+            const lower = text.toLowerCase();
+            const offsets = new Set<number>();
+            for (const needle of needles) {
+                const index = lower.indexOf(needle);
+                if (index < 0) continue;
+                const start = lower.length === text.length ? index : originalLowercaseSpan(text, index, index + needle.length).start;
+                offsets.add(start);
+            }
+            const windows: string[] = [];
+            let end = 0;
+            for (const offset of [...offsets].sort((a, b) => a - b)) {
+                if (offset < end) continue;
+                const start = Math.max(end, offset - SNIPPET_AHEAD);
+                end = Math.min(text.length, start + SNIPPET_TOTAL);
+                windows.push(safeMidSlice(text, start, end));
+            }
+            excerpt = windows.length > 0 ? windows.join("\n…\n") : safePrefix(text, SNIPPET_TOTAL);
+        }
+        docs.push({ kind: "message", role: "tool", ref, title, text: `${excerpt}\n${title}` });
+    }
+    return docs;
+}
+
 export function executeSearchContext(
     args: Record<string, unknown>,
     _core: CompressionCore,
@@ -850,6 +888,7 @@ export function executeSearchContext(
     foreignSessionId?: string,
     plan?: SearchPlanOpts,
     originals?: OriginalTextProvider,
+    archive?: Session,
 ): ProxyToolResult {
     const query = typeof args.query === "string" ? args.query : "";
     if (query.length === 0) return toolFail("[search_context FAILED: query is required]");
@@ -869,8 +908,9 @@ export function executeSearchContext(
     // semantics — one literal occurrence is a positive signal, never
     // silently dropped (#2158), zero occurrences = no match.
     const blockById = new Map(state.blocks.map((b) => [b.blockId, b]));
-    const pool = searchBlocks(blockDocs(state), query, { limit: state.blocks.length, algorithm: "substring", minScore: 1e-9 })
-        .map((r) => blockById.get(r.ref))
+    const summaryDocs = blockDocs(state);
+    const literal = searchBlocks(summaryDocs, query, { limit: state.blocks.length, algorithm: "substring", minScore: 1e-9 });
+    const pool = literal.map((r) => blockById.get(r.ref))
         .filter((b): b is CompressionBlock => b !== undefined);
     const freq = poolTermFrequency(pool, terms);
     let ranked = pool;
@@ -885,7 +925,34 @@ export function executeSearchContext(
             plan.log(`[acp-search-plan] "${query}": ${withScores.filter((s) => s.score > 0).length}/${pool.length} candidates plan-relevant → ${scored.slice(0, limit).map((s) => `${s.block.blockId}:${s.score}`).join(", ")}`);
         }
     }
-    const blocks = ranked.slice(0, limit);
+    let blocks = ranked.slice(0, limit);
+    let combined: SearchResult[] = [];
+    if (archive && !foreignSessionId && terms.length > 0 && limit > 0) {
+        try {
+            const docs = archiveSearchDocs(archive, query, terms);
+            if (docs.length > 0) {
+                const candidates = searchBlocks([...summaryDocs, ...docs], query, {
+                    algorithm: "bm25", limit: summaryDocs.length + docs.length, minScore: 1e-9,
+                });
+                if (candidates.some((r) => r.kind === "message")) {
+                    const refs = new Set(candidates.map((r) => r.ref));
+                    for (const hit of literal) if (!refs.has(hit.ref)) candidates.push(hit);
+                    combined = candidates;
+                    if (scored) {
+                        // Keep the plan's block order within the slots occupied by summaries.
+                        const rank = new Map(ranked.map((block, index) => [block.blockId, index]));
+                        const planned = candidates.filter((r) => r.kind === "block");
+                        planned.sort((a, b) => (rank.get(a.ref) ?? ranked.length) - (rank.get(b.ref) ?? ranked.length));
+                        let next = 0;
+                        combined = candidates.map((r) => r.kind === "block" ? planned[next++] : r);
+                    }
+                    blocks = combined.slice(0, limit).flatMap((r) => blockById.get(r.ref) ?? []);
+                }
+            }
+        } catch (err) {
+            plan?.log(`[acp-search] CCR archive unavailable: ${String(err)}`);
+        }
+    }
     // #4154: second corpus — the verbatim pre-fold text of every block the
     // host still holds. Capped at `limit` extra lines; blocks already ranked
     // via their summary are not repeated. Exceptions degrade to nothing:
@@ -919,11 +986,16 @@ export function executeSearchContext(
             // originals are best-effort; never fail the search
         }
     }
-    if (blocks.length === 0 && origHits.length === 0) {
+    if (blocks.length === 0 && origHits.length === 0 && combined.length === 0) {
         // #1875: an empty result is a valid answer to a query, not a failure.
-        if (state.blocks.length === 0) return toolOk(`[No compressed blocks exist yet${scope} — nothing to search.]`);
+        const archiveNote = archive ? " + archived tool outputs" : "";
+        if (state.blocks.length === 0) {
+            return toolOk(archive
+                ? `[No blocks matched "${query}". Scope = archived tool outputs in the current session.]`
+                : `[No compressed blocks exist yet${scope} — nothing to search.]`);
+        }
         const origNote = originals ? " + the folded original text" : "";
-        return toolOk(`[No blocks matched "${query}" among ${state.blocks.length} block(s)${scope}. Scope = compressed topics/summaries (active + folded-away)${origNote} — NOT visible messages or other sessions; absence here ≠ never-discussed.]`);
+        return toolOk(`[No blocks matched "${query}" among ${state.blocks.length} block(s)${scope}. Scope = compressed topics/summaries (active + folded-away)${origNote}${archiveNote} — NOT visible messages or other sessions; absence here ≠ never-discussed.]`);
     }
     const lines = blocks.map((b) => {
         const topic = b.topic ?? "(no topic)";
@@ -946,8 +1018,10 @@ export function executeSearchContext(
         const returned = new Set(blocks);
         steering = buildSteering(scored.filter((s) => returned.has(s.block)), state, plan.session);
     }
-    const truncNote = ranked.length > blocks.length
-        ? `\n\n[truncated: showing ${blocks.length} of ${ranked.length} candidates by relevance — pass limit:${ranked.length} to see the rest]`
+    const totalRanked = combined.length || ranked.length;
+    const shown = combined.length > 0 ? Math.min(combined.length, limit) : blocks.length;
+    const truncNote = totalRanked > shown
+        ? `\n\n[truncated: showing ${shown} of ${totalRanked} candidates by relevance — pass limit:${totalRanked} to see the rest]`
         : "";
     const tip = narrowingHint(terms, blocks, ranked);
     const tipNote = tip ? `\n\n${tip}` : "";
@@ -957,6 +1031,14 @@ export function executeSearchContext(
     const note = foreignSessionId
         ? `\n\n[Read-only search of historical session ${foreignSessionId}. Block ids are per-session namespaces — decompress acts on the current session only. For bulk content use bili export ${foreignSessionId} [--full].]`
         : "";
+    if (combined.length > 0) {
+        let nextBlock = 0;
+        const hits = combined.slice(0, limit).map((r) => r.kind === "block"
+            ? lines[nextBlock++]
+            : `${r.ref} (archived tool output) ${JSON.stringify(r.title)}\n  ${r.preview.replace(/\s+/gu, " ")}`);
+        const archiveNote = hits.length > blocks.length ? `\n\nUse ${retrieveToolName(archive)} with the message ref for the full archived output.` : "";
+        return toolOk(`Found ${shown} result(s) for "${query}":\n\n${hits.join("\n\n")}${truncNote}${steering}${tipNote}${origSection}${archiveNote}`);
+    }
     const header = blocks.length === 0
         ? `Found 0 summary block(s) for "${query}"${scope} — but ${origHits.length} folded original(s) match:`
         : `Found ${blocks.length} block(s) for "${query}"${scope}:`;
@@ -989,10 +1071,12 @@ export function executeSearchContextTarget(
     // blockContents (resident or lazy-reloaded from the store) feeds the
     // folded-original-text corpus.
     const ownOriginals = ctx ? originalTextsOf(ctx.session) : undefined;
+    const session = ctx?.session;
+    const ownArchive = ccrEnabled(session) && jevCcrActive(session) ? session : undefined;
     // #1125: honor the param description's "Defaults to the current conversation" —
     // the literal "current" (any case) resolves to this session, not the foreign lookup.
     if (!requested || requested === sessionId || requested.toLowerCase() === "current") {
-        const local = executeSearchContext(args, core, state, undefined, plan, ownOriginals);
+        const local = executeSearchContext(args, core, state, undefined, plan, ownOriginals, ownArchive);
         // #1333: a derived session (pi RLM child) has no blocks of its own —
         // fall back to the recorded parent chain (read-only) instead of a
         // bare "nothing to search".
@@ -1010,7 +1094,7 @@ export function executeSearchContextTarget(
     // A self-reference under an alias form (canonical pfa-* id) keeps plain
     // current-session semantics — no "historical session" framing.
     const self = peekSession(requested) ?? findSessionByCanonicalId(requested);
-    if (self?.id === sessionId) return executeSearchContext(args, core, state, undefined, plan, ownOriginals);
+    if (self?.id === sessionId) return executeSearchContext(args, core, state, undefined, plan, ownOriginals, ownArchive);
     const resident = self ?? undefined;
     const foreign = resolveForeignSessionState(requested);
     if (!foreign) return toolFail(`[search_context FAILED: unknown session "${requested}"]`);

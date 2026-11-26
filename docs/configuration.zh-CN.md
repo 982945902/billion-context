@@ -1678,6 +1678,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 
 **OMP 的 Jev 裁剪试验。** 代理开启 `compress.ccr.enabled` 和 `compress.ccr.jevTrial`，OMP 客户端设置 `BILI_JEV_CCR=1`。让 bili 收到完整工具输出；旧版 Jev harness 需要关闭自身的裁剪。支持 Chat Completions 和携带完整历史的 Responses。Responses 只有在原生取回工具可用、且能确认 OMP 会话所有者时才归档；不能只凭父子会话共享的模型缓存键判断归属。不含完整历史的续接请求不会创建新归档。
 
+在当前 OMP 会话内，`search_context` 可同时查找压缩摘要和已归档的工具输出。归档命中会返回摘录和消息 ref，可用配置的取回工具读取原文。搜索在本地运行，重启后仍可查找已保存的归档。
+
 代理从 `~/.pi/agent/jev-harness.json` 读取 `baseUrl`（完整 System One 地址）、`apiKey`、`model`；可用 `BILI_JEV_CONFIG` 指定另一份文件，用 `BILI_JEV_API_KEY` 覆盖其中的密钥。缺省地址为 `http://127.0.0.1:3425/v1/systemone`，模型为 `group/jev`。每批最多发 12 项限长摘录，网络预算 1.2 秒。判断失败、置信度不足或无法确认原文已持久化时，保留全文。
 
 - **类型：** `object`（`{ enabled?, minToolTokens?, excludeTools?, toolName?, maxHeadChars? }`）

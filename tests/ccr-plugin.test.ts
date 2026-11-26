@@ -826,6 +826,24 @@ for (const protocol of ["chat/completions", "responses"] as const) test(`OMP ${p
         _setStoreForTest(storage);
         assert.deepEqual(await send(child, child), first);
         assert.equal(batches.length, 1, "resumed full and stored outputs both replay without a judgment");
+        for (const [conversationId, target] of [[child, undefined], [parent, undefined], [parent, child]]) {
+            const searched = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
+                method: "POST", headers: { "content-type": "application/json" },
+                body: JSON.stringify({ conversationId, nativeCaller: true, tool: "search_context",
+                    args: { query: "UNIQUE CHILD LINE", limit: 1, conversation_id: target } }),
+            });
+            const { result } = await searched.json() as { result?: string };
+            assert.equal(searched.status, 200);
+            if (conversationId === child) {
+                assert.ok(result);
+                assert.ok(result.includes(`${ref} (archived tool output)`), result);
+                assert.match(result, /\n  [^\n]*UNIQUE CHILD LINE/);
+                assert.match(result, /Use acp_retrieve with the message ref/);
+            } else {
+                assert.doesNotMatch(result ?? "", /archived tool output/);
+            }
+        }
+        assert.equal(batches.length, 1, "searching the archive uses local ranking");
         const retrieved = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
             method: "POST", headers: { "content-type": "application/json" },
             body: JSON.stringify({ conversationId: child, nativeCaller: true, tool: "acp_retrieve", args: { ref } }),

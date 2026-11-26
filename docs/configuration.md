@@ -1693,6 +1693,8 @@ Independent of the zero-byte-cut re-issue (#2171), which keeps its own one-shot 
 
 **Experimental Jev policy for OMP.** Enable `compress.ccr.enabled` and `compress.ccr.jevTrial` on the proxy and set `BILI_JEV_CCR=1` in the OMP client. Let bili see the original tool output (disable trimming in older Jev harnesses). Chat Completions and full-history Responses are supported. Responses only archives when the native retrieval tool is callable and the OMP session owner is verified; a shared provider cache key alone is not proof. Continuations without complete history do not create new archives.
 
+In the current OMP session, `search_context` can rank archived tool output alongside compressed summaries. Archive hits include an excerpt and the message ref for the configured retrieval tool. Search runs locally, including after a restart.
+
 The proxy reads `baseUrl` (the complete System One endpoint), `apiKey`, and `model` from `~/.pi/agent/jev-harness.json`. `BILI_JEV_CONFIG` selects another file; `BILI_JEV_API_KEY` overrides its key. Defaults: `http://127.0.0.1:3425/v1/systemone`, `group/jev`. Each batch contains bounded samples from up to 12 results with a 1.2-second network deadline. Errors, uncertain judgments and unconfirmed storage keep the original.
 
 - **Type:** `object` (`{ enabled?, minToolTokens?, excludeTools?, toolName?, maxHeadChars? }`)
