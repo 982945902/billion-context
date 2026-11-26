@@ -55,15 +55,20 @@ function streamOf(events: string[]): ReadableStream<Uint8Array> {
     });
 }
 
-function erroredStream(events: string[]): ReadableStream<Uint8Array> {
+function erroredStream(events: string[], error = new Error("simulated upstream read failure")): ReadableStream<Uint8Array> {
     const enc = new TextEncoder();
     let i = 0;
     return new ReadableStream<Uint8Array>({
         pull(controller) {
             if (i < events.length) controller.enqueue(enc.encode(events[i++]));
-            else controller.error(new Error("simulated upstream read failure"));
+            else controller.error(error);
         },
     });
+}
+
+function resetStream(events: string[]): ReadableStream<Uint8Array> {
+    const cause = Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" });
+    return erroredStream(events, new TypeError("terminated", { cause }));
 }
 
 function chatChunk(delta: Record<string, unknown>, extra: Record<string, unknown> = {}): string {
@@ -98,14 +103,14 @@ test("chat pipe: zero-data-frame EOF re-issues once and the client sees the full
     assert.ok(logs.some((l) => l.includes("#2171")), "the retry is logged");
 });
 
-test("chat pipe: a retry that also dies at zero frames falls back to the #721 in-band error, exactly one re-issue (#2171)", async () => {
+test("chat pipe: two zero-frame socket resets spend one retry, then emit the truncation error (#2171)", async () => {
     const out: string[] = [];
     let refetches = 0;
     const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
         refetches += 1;
-        return Promise.resolve(streamOf([]));
+        return Promise.resolve(resetStream([]));
     };
-    await pipePluginChatWithStrip(streamOf([]), makeRes(out), "openai", makeSession(), undefined, refetch, "http://up");
+    await pipePluginChatWithStrip(resetStream([]), makeRes(out), "openai", makeSession(), undefined, refetch, "http://up");
     const body = out.join("");
     assert.equal(refetches, 1, "the re-issue budget is one");
     assert.ok(body.includes(ERROR_SENTINEL), "second failure surfaces the truncation signal");
@@ -219,7 +224,7 @@ test("responses pipe: a healed stream that completes degenerate spends its OWN d
     assert.ok(body.includes("resp_3"), "the second (degenerate) retry's lifecycle reaches the client");
 });
 
-test("chat pipe: a comment-only upstream stream (keep-alive pings, zero data frames) still retries (#2171)", async () => {
+test("chat pipe: socket reset after only keep-alive comments still retries (#2171)", async () => {
     const out: string[] = [];
     let refetches = 0;
     const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
@@ -227,7 +232,7 @@ test("chat pipe: a comment-only upstream stream (keep-alive pings, zero data fra
         return Promise.resolve(streamOf([chatChunk({ role: "assistant", content: "healed" }), chatFinish("stop"), DONE]));
     };
     await pipePluginChatWithStrip(
-        streamOf([": ping\n\n", ": ping\n\n"]),
+        resetStream([": ping\n\n", ": ping\n\n"]),
         makeRes(out), "openai", makeSession(), undefined, refetch, "http://up",
     );
     assert.equal(refetches, 1, "SSE comments carry no protocol events — the zero-visible predicate must hold");
@@ -244,28 +249,30 @@ test("OMP-owned read error does not spend the proxy reasoning-only retry", async
         makeRes(out), "openai", makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true,
     );
     assert.equal(refetches, 0);
-    assert.ok(out.join("").includes(ERROR_SENTINEL));
+    assert.ok(out.join("").includes("private reasoning"));
+    assert.ok(!out.join("").includes(ERROR_SENTINEL));
+    assert.ok(!out.join("").includes("[DONE]"));
 });
 
-test("OMP-owned truncation: chat pipe does not spend a proxy retry and returns the in-band error", async () => {
+test("OMP-owned zero-frame socket reset: chat pipe leaves bare EOF for host recovery", async () => {
     const out: string[] = [];
     let refetches = 0;
     const refetch = (): Promise<ReadableStream<Uint8Array> | null> => { refetches++; return Promise.resolve(streamOf([])); };
-    await pipePluginChatWithStrip(streamOf([]), makeRes(out), "openai", makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true);
+    await pipePluginChatWithStrip(resetStream([]), makeRes(out), "openai", makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true);
     assert.equal(refetches, 0);
-    assert.ok(out.join("").includes(ERROR_SENTINEL));
+    assert.equal(out.join(""), "");
 });
 
-test("responses pipe: OMP-owned truncation does not spend a proxy retry and returns the in-band error", async () => {
+test("OMP-owned zero-frame socket reset: responses pipe leaves bare EOF for host recovery", async () => {
     const out: string[] = [];
     let refetches = 0;
     const refetch = (): Promise<ReadableStream<Uint8Array> | null> => { refetches++; return Promise.resolve(streamOf([])); };
-    await pipePluginResponsesWithStrip(streamOf([]), makeRes(out), makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, true);
+    await pipePluginResponsesWithStrip(resetStream([]), makeRes(out), makeSession(), undefined, refetch, "http://up", undefined, undefined, undefined, undefined, true);
     assert.equal(refetches, 0);
-    assert.ok(out.join("").includes(ERROR_SENTINEL));
+    assert.equal(out.join(""), "");
 });
 
-test("responses pipe: a comment-only upstream stream (keep-alive pings, zero data frames) still retries (#2171)", async () => {
+test("responses pipe: socket reset after only keep-alive comments still retries (#2171)", async () => {
     const out: string[] = [];
     let refetches = 0;
     const sse = (type: string, payload: Record<string, unknown>) => `event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`;
@@ -283,7 +290,7 @@ test("responses pipe: a comment-only upstream stream (keep-alive pings, zero dat
         ]));
     };
     await pipePluginResponsesWithStrip(
-        streamOf([": ping\n\n", ": ping\n\n"]),
+        resetStream([": ping\n\n", ": ping\n\n"]),
         makeRes(out), makeSession(), undefined, refetch, "http://up",
     );
     assert.equal(refetches, 1, "SSE comments carry no protocol events — the zero-visible predicate must hold");

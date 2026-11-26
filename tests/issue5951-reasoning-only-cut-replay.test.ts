@@ -343,7 +343,8 @@ test("chat pipe: the host owning truncation recovery suppresses the replay (#595
 
     const body = out.join("");
     assert.equal(refetches, 0, "the host's own recovery owns the single retry budget");
-    assert.ok(body.includes(ERROR_SENTINEL), "the host is told the cut happened, so its own retry can run");
+    assert.ok(!body.includes(ERROR_SENTINEL), "the native classifier gets the bare EOF");
+    assert.ok(!body.includes("[DONE]"), "the cut must not look like a completed turn");
     assert.equal(body.split("reasoning-a").length - 1, 1, "the partial reasoning the client already holds is still forwarded");
     const replay = diagFromLogs(logs)["replay"] as Record<string, unknown> | undefined;
     assert.equal(replay?.["replayAvailable"], true, "the diag still records that a replay door existed");
@@ -360,5 +361,5 @@ test("chat pipe: the host owning recovery also suppresses the zero-byte replay (
     await pipePluginChatWithStrip(eventsStream([]), makeRes(out), "openai", makeSession(), () => {}, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true);
 
     assert.equal(refetches, 0, "a cut with no client-visible output is still the host's to recover");
-    assert.ok(out.join("").includes(ERROR_SENTINEL));
+    assert.equal(out.join(""), "");
 });
