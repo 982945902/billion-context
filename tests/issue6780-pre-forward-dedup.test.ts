@@ -206,3 +206,40 @@ test("#6780 P0 (F2): the arm is single-shot — a later standalone markDirty can
         assert.equal(ingests(), 2, "a stale arm must not justify skipping a save it never covered");
     });
 });
+
+test("isolated writer settles durability and KV writes before closing the index", {
+    skip: Boolean(process.versions.bun) || typeof Promise.withResolvers !== "function",
+    timeout: 15_000,
+}, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-writer-process-"));
+    const storeDir = path.join(dir, "sessions");
+    const session = loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
+    const previous = process.env.BILI_STORAGE_UNIFIED;
+    const previousWriter = process.env.BILI_SQLITE_WRITER_PROCESS;
+    process.env.BILI_STORAGE_UNIFIED = "sqlite";
+    process.env.BILI_SQLITE_WRITER_PROCESS = "1";
+    let store: SessionStore | undefined;
+    try {
+        store = new SessionStore({ dir: storeDir, debounceMs: 60_000, enabled: true });
+        const ingest = store.ingestRowsForRequest(session);
+        const settled = store.afterNextFlush(session.id);
+        await ingest;
+        assert.equal(await settled, true);
+        assert.ok(store.loadSync(session.id, session.meta));
+
+        await assert.rejects(store.setKvAsync("writer-test", "invalid", undefined), /JSON-serializable/);
+        const kv = store.setKvAsync("writer-test", "committed", { revision: 2 });
+        await Promise.all([kv, store.flushAll()]);
+
+        store = new SessionStore({ dir: storeDir, debounceMs: 60_000, enabled: true });
+        assert.deepEqual(await store.getKvAsync("writer-test", "committed"), { revision: 2 });
+        assert.ok(store.loadSync(session.id, session.meta));
+    } finally {
+        await store?.closeQuietlyAsync();
+        if (previous === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = previous;
+        if (previousWriter === undefined) delete process.env.BILI_SQLITE_WRITER_PROCESS;
+        else process.env.BILI_SQLITE_WRITER_PROCESS = previousWriter;
+        rmBestEffort(dir);
+    }
+});

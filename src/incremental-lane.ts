@@ -1084,7 +1084,7 @@ export async function handleIncrementalTurn(
         // only the small row ingest moves ahead of it. Best-effort: the
         // debounced save below retries the full path on failure.
         try {
-            if (session) getStore().ingestRowsNow(session);
+            if (session) await getStore().ingestRowsForRequest(session);
         } catch {
             // best-effort, same failure posture as the debounced save
         }

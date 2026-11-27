@@ -926,7 +926,7 @@ export async function prepareOpenai(
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
-    getStore().ingestRowsNow(session);
+    await getStore().ingestRowsForRequest(session);
     // #5874 P2-final: the in-request snapshot flush above already persisted
     // this revision; re-arm the debounce only if the session mutated since
     // (stats probes land at the next flush) or the flush never landed.

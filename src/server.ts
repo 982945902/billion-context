@@ -1790,7 +1790,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // not lose recent compression state. SIGKILL/power loss cannot flush, but
     // debounced writes keep disk within ~500ms of in-memory state.
     let shuttingDown = false;
-    const finishShutdown = (): void => {
+    const finishDrain = (): void => {
         void (async () => {
             // #5753: affinity now settles into sqlite — await its queued
             // writes so a graceful exit loses nothing recorded this run.
@@ -1800,20 +1800,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 await flushPrefixAffinity();
                 await flushResignPending();
             })());
+            await withExitDeadline("conversation/session flushes", (async () => {
+                await flushConversations();
+                await flushAllSessions();
+            })());
             servedWriter?.dispose();
             clearProxyInstanceFile(instanceId);
             unregisterInstance(instanceId);
             closeLogger();
             process.exit(0);
-        })();
-    };
-    const finishDrain = (): void => {
-        void (async () => {
-            await withExitDeadline("conversation/session flushes", (async () => {
-                await flushConversations();
-                await flushAllSessions();
-            })());
-            finishShutdown();
         })();
     };
     const shutdown = (sig: string) => {

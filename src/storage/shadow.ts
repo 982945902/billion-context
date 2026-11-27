@@ -45,6 +45,7 @@ import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
 import { sqliteCorruptionDetail } from "./sqlite-errors.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
+import type { IngestReceipt } from "./writer-process.js";
 import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
@@ -234,7 +235,7 @@ function cap(s: string): string {
 // discipline, #2030); re-exported here for the storage-layer importers.
 export { resolveStorageMode, type StorageMode } from "../knobs.ts";
 
-interface ShadowStats {
+export interface ShadowStats {
     ingests: number;
     deltaIngests: number;
     /** #3133: sampled read-back verifications RUN (verifyOk + verifyDrift
@@ -383,6 +384,12 @@ export class UnifiedShadow {
         return this.sync
             ? { name: this.sync.engine, source: this.sync.engineSource }
             : { name: "mysql", source: "network" };
+    }
+
+    static openWriter(dir: string, legacyLoad: (record: unknown) => LegacySessionLike | null, fileWalLimit?: number): UnifiedShadow {
+        const dbPath = path.join(dir, "index.db");
+        const walLimit = resolveStorageWalJournalSizeLimit(process.env, fileWalLimit);
+        return new UnifiedShadow("full", UnifiedStore.openCompanion(dbPath, walLimit), legacyLoad, undefined, dbPath);
     }
 
     /** Opens the sidecar when a knob asks for one; null (no cost) otherwise.
@@ -838,6 +845,26 @@ export class UnifiedShadow {
             this.consecutiveFailures = 0;
         } catch (err) {
             this.noteIngestFailure(err, phase, sessionId);
+        }
+    }
+
+    forgetIngestTrust(sessionId: string): void {
+        this.sync?.forgetIngestTrust(sessionId);
+    }
+
+    noteIsolatedReceipt(id: string, receipt: IngestReceipt): void {
+        for (const key of ["ingests", "deltaIngests", "verifySamples", "verifyOk", "verifyDrift"] as const) {
+            this.stats[key] += receipt.stats[key];
+        }
+        if (receipt.stats.lastError) this.stats.lastError = receipt.stats.lastError;
+        if (receipt.drifted) this.driftedSessions.add(id);
+        else this.driftedSessions.delete(id);
+        if (receipt.frozenSince !== undefined) {
+            this.frozenEnvelopeIds.add(id);
+            this.frozenEnvelopeSince.set(id, receipt.frozenSince);
+        } else {
+            this.frozenEnvelopeIds.delete(id);
+            this.frozenEnvelopeSince.delete(id);
         }
     }
 

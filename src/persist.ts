@@ -43,6 +43,7 @@ import { featureEnabled } from "./rollout.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
+import { SessionWriterProcess } from "./storage/writer-process.js";
 import { sha256Hex, type CheckpointRow, type MessageRefContentRow, type MessageIdContentRow } from "./storage/store.js";
 import { contentStoreOf } from "./store.js";
 import { CALIBRATION_PROVENANCE_TEXT_ONLY, type WireProtocol } from "./util.js";
@@ -562,6 +563,10 @@ export class SessionStore {
      *  synchronously on EVERY call; a microtask-batched run per turn keeps
      *  the immediate-ish semantics while coalescing same-tick calls. */
     private readonly writerOffPending = new Map<string, () => void>();
+    private isolatedWriter?: SessionWriterProcess;
+    private isolatedTail = Promise.resolve();
+    private readonly isolatedPending = new Map<string, number>();
+    private readonly parentWrites = new Set<string>();
     /** #6780 P0: armed proof that a pre-forward durability ingest (#6326,
      *  ingestRowsNow) already made THIS session's current state durable in
      *  this tick. The writer-off coalesced build (armed by prepare's
@@ -2768,8 +2773,9 @@ export class SessionStore {
 
     /** #3388/#3931 async twins: network backends (mysql) resolve ONLY through
      *  these — the sync facades above miss-noop there (sync handle absent).
-     *  On sqlite they wrap the very same synchronous calls in one microtask. */
+     *  SQLite writes use the child when writer isolation is enabled. */
     setKvAsync(namespace: string, key: string, value: unknown): Promise<void> {
+        if (this.useIsolatedWriter()) return this.queueWriter(() => this.sqliteWriter().setKv(namespace, key, value));
         return this.liveShadow().setKvAsync(namespace, key, value);
     }
 
@@ -3240,6 +3246,7 @@ export class SessionStore {
             const record = this.buildRecordForSave(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
+                if (this.isolatedWriter) this.parentWrites.add(session.id);
                 // #3301: external-converter import payload rides exactly ONE
                 // save into the unified index (first-open imports take the
                 // importRecord path), then is consumed so steady saves keep
@@ -3286,6 +3293,7 @@ export class SessionStore {
             // to the live session so serving converges on the same newest-wins
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
+            if (this.isolatedWriter) this.parentWrites.add(session.id);
             if (!this.egressProjectionFrozen(session)) this.shadow?.record(disk);
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
@@ -3473,6 +3481,82 @@ export class SessionStore {
         }
     }
 
+    private useIsolatedWriter(): boolean {
+        return process.env.BILI_SQLITE_WRITER_PROCESS === "1" && !process.versions.bun &&
+            typeof Promise.withResolvers === "function" && this.writerOffActive() && this.shadow?.isAsyncBackend === false;
+    }
+
+    private sqliteWriter(): SessionWriterProcess {
+        return this.isolatedWriter ??= new SessionWriterProcess(this.sessionsDir, fileStorageWalJournalSizeLimit());
+    }
+
+    private queueWriter<T>(work: () => Promise<T>): Promise<T> {
+        const job = this.isolatedTail.then(work);
+        this.isolatedTail = job.then(() => undefined, () => undefined);
+        return job;
+    }
+
+    /** Builds against live state only when it reaches the writer, preserving the
+     * parent-side ordering of stale guards, commit proofs and resident-field drops. */
+    private queueIsolatedSave<T>(id: string, work: () => Promise<T>): Promise<T> {
+        this.isolatedPending.set(id, (this.isolatedPending.get(id) ?? 0) + 1);
+        return this.queueWriter(work).finally(() => {
+            const count = this.isolatedPending.get(id)!;
+            if (count === 1) this.isolatedPending.delete(id);
+            else this.isolatedPending.set(id, count - 1);
+        });
+    }
+
+    private async commitIsolated(session: Session, armSkip = false): Promise<PersistedSession> {
+        const shadow = this.shadow!;
+        const record = this.buildRecordForSave(session, this.liveStorageStamp);
+        const disk = this.staleDiskPayload(record);
+        const committed = disk ?? record;
+        if (disk) this.convergeToDisk(session, disk);
+        const epoch = session.revisionEpoch;
+        const messages = session.lastMessages;
+        if (!this.egressProjectionFrozen(session)) {
+            const resetTrust = this.parentWrites.has(session.id);
+            const payload = disk ? undefined : session.decompositionLog;
+            const tail = !disk && session.lastMessagesFolded !== true ? session.lastMessages : undefined;
+            const contentStore = disk || !session.contentStore ? undefined : { ...session.contentStore };
+            const state = { ...committed.state };
+            const outgoing = { ...committed, state, forkContentStore: committed.forkContentStore ? { ...committed.forkContentStore } : undefined };
+            const metadata = JSON.stringify(session.metadata);
+            const receipt = await this.sqliteWriter().save({
+                id: session.id, resetTrust,
+                record: payload === undefined ? outgoing : { ...outgoing, decompositionLog: payload },
+                rawTail: tail?.length ? { lastMessages: tail } : undefined,
+                contentStore,
+            });
+            shadow.noteIsolatedReceipt(session.id, receipt);
+            if (!receipt.committed) throw new Error(receipt.stats.lastError ?? `SQLite writer did not commit ${session.id}`);
+            this.parentWrites.delete(session.id);
+            shadow.forgetIngestTrust(session.id);
+            if (payload !== undefined && session.decompositionLog === payload) session.decompositionLog = undefined;
+            this.noteOwnCommit(session.id, outgoing);
+            if (armSkip && epoch === session.revisionEpoch && messages === session.lastMessages &&
+                metadata === JSON.stringify(session.metadata)) this.armDurabilitySkip(session, committed);
+        }
+        return committed;
+    }
+
+    ingestRowsForRequest(session: Session): Promise<void> | void {
+        if (!this.useIsolatedWriter()) return this.ingestRowsNow(session);
+        if (this.egressProjectionFrozen(session)) return;
+        let landed = false;
+        return this.queueIsolatedSave(session.id, async () => {
+            try {
+                await this.commitIsolated(session, true);
+                landed = true;
+            } catch (err) {
+                this.log("warn", `[persist] ingestRowsForRequest failed for ${session.id}: ${String(err)} — the scheduled save retries`);
+            }
+        }).finally(() => {
+            if (!this.hasPending(session.id)) this.drainFlushWaiters(session.id, landed);
+        });
+    }
+
     /** #6780 P0: record that `record` (just ingested by ingestRowsNow) is
      *  exactly the session's current state, so the writer-off coalesced
      *  build armed by this tick's prepare markDirty can skip its duplicate
@@ -3516,6 +3600,41 @@ export class SessionStore {
             // persists the freshest view (nothing between now and the
             // microtask can be lost: it re-arms through this same path).
             if (this.writerOffPending.has(session.id)) return;
+            if (this.useIsolatedWriter()) {
+                let queued = false;
+                const run = (): void => {
+                    if (queued) return;
+                    queued = true;
+                    void this.queueIsolatedSave(session.id, async () => {
+                        this.writerOffPending.delete(session.id);
+                        try {
+                            const proofRevision = session.revisionEpoch;
+                            const arm = this.durabilityArms.get(session.id);
+                            this.durabilityArms.delete(session.id);
+                            const canReuse = arm !== undefined &&
+                                (proofRevision ?? 0) === arm.epoch + 1 && session.lastMessages === arm.messagesRef &&
+                                session.decompositionLog === undefined && !session.contentStoreDirty &&
+                                session.pendingLedgerAlign === undefined && JSON.stringify(session.metadata) === arm.metadataFp;
+                            const metadata = canReuse ? arm.metadata : (await this.commitIsolated(session)).metadata ?? {};
+                            this.maybeCutForkBase(session);
+                            this.noteMetaFp(session.id, metadata);
+                            if (!this.egressProjectionFrozen(session)) this.noteDurable(session.id, proofRevision);
+                            this.lastSaveLanded.set(session.id, true);
+                            this.runIdleSpillIfIdle(session.id);
+                        } catch (err) {
+                            this.lastSaveLanded.set(session.id, false);
+                            this.log("error", `[persist] isolated save failed for ${session.id}: ${String(err)}`);
+                        }
+                    }).finally(() => {
+                        if (!this.hasPending(session.id)) this.drainFlushWaiters(session.id, this.lastSaveLanded.get(session.id) === true);
+                    });
+                };
+                this.writerOffPending.set(session.id, run);
+                queueMicrotask(() => {
+                    if (this.writerOffPending.get(session.id) === run) run();
+                });
+                return;
+            }
             const run = (): void => {
                 this.writerOffPending.delete(session.id);
                 // #4788 D2: prove what THIS build covers BEFORE it starts —
@@ -3678,7 +3797,8 @@ export class SessionStore {
     async afterNextFlush(sessionId: string): Promise<boolean> {
         if (!this.saveTimers.has(sessionId)
             && !this.writerOffPending.has(sessionId)
-            && !this.saveWritesInFlight.has(sessionId)) {
+            && !this.saveWritesInFlight.has(sessionId)
+            && !this.isolatedPending.has(sessionId)) {
             return true;
         }
         return await new Promise<boolean>((resolve) => {
@@ -3811,6 +3931,25 @@ export class SessionStore {
         const frozen = this.envelopeFrozen(session.id);
         if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
             if (frozen) this.noteFrozenSkip(session.id, "writeNow");
+            if (this.useIsolatedWriter()) {
+                try {
+                    await this.queueIsolatedSave(session.id, async () => {
+                        const proofRevision = session.revisionEpoch;
+                        const rec = await this.commitIsolated(session);
+                        this.maybeCutForkBase(session);
+                        this.noteMetaFp(session.id, rec.metadata ?? {});
+                        if (!this.egressProjectionFrozen(session)) this.noteDurable(session.id, proofRevision);
+                        this.lastSaveLanded.set(session.id, true);
+                        this.runIdleSpillIfIdle(session.id);
+                    });
+                } catch (err) {
+                    this.lastSaveLanded.set(session.id, false);
+                    throw err;
+                } finally {
+                    if (!this.hasPending(session.id)) this.drainFlushWaiters(session.id, this.lastSaveLanded.get(session.id) === true);
+                }
+                return;
+            }
             // #3133: drop the armed microtask (token mismatch below) — this
             // sync build subsumes it; later mutations re-arm on their own.
             this.writerOffPending.delete(session.id);
@@ -4126,6 +4265,7 @@ export class SessionStore {
      *  Returns true on success, false on failure (caller must NOT evict on
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
+        if (this.isolatedPending.has(session.id)) return false;
         this.consumePendingLedgerAlign(session); // #5608-D: before any serialization
         if (!this.saveContentStore(session)) return false;
         this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
@@ -4249,6 +4389,8 @@ export class SessionStore {
         for (const session of sessions) this.saveContentStore(session);
         await this.flushScheduledSaves();
         await this.store.flushAll();
+        await this.isolatedTail;
+        await this.isolatedWriter?.close();
         this.shadow?.close();
     }
 
@@ -4294,6 +4436,7 @@ export class SessionStore {
      *  the caller's cleanup. Never throws. */
     closeQuietly(): void {
         this.cancelAll();
+        void this.isolatedWriter?.close().catch(err => this.log("warn", `[storage] SQLite writer close failed: ${String(err)}`));
         this.shadow?.close();
     }
 
@@ -4305,12 +4448,14 @@ export class SessionStore {
     async closeQuietlyAsync(): Promise<void> {
         await this.ready();
         this.cancelAll();
+        await this.isolatedTail;
+        await this.isolatedWriter?.close();
         await this.shadow?.closeAsync();
     }
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
     hasPending(id: string): boolean {
-        return this.saveTimers.has(id) || this.writerOffPending.has(id);
+        return this.saveTimers.has(id) || this.writerOffPending.has(id) || this.isolatedPending.has(id);
     }
 
     /** Phase 3 (#2960): the JSON envelope is skipped while the operator asked
@@ -4339,9 +4484,8 @@ export class SessionStore {
         this.writerOffPending.clear();
     }
 
-    /** #3133: run and clear armed writerOff builds now (shutdown path). */
+    /** Run armed writes before closing the storage writer. */
     private drainWriterOffPending(): void {
-        if (this.writerOffPending.size === 0) return;
         const runs = [...this.writerOffPending.values()];
         this.writerOffPending.clear();
         for (const run of runs) run();

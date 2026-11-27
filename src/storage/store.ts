@@ -854,6 +854,19 @@ export class UnifiedStore {
         return store;
     }
 
+    /** Open a companion connection after the primary has initialized the database. */
+    static openCompanion(path: string, walLimit: number): UnifiedStore {
+        if (!existsSync(path)) throw new Error(`SQLite writer database does not exist: ${path}`);
+        const { db, engine, source } = openSqliteDatabase(path);
+        try {
+            for (const pragma of storagePragmas(walLimit).slice(2)) db.exec(pragma);
+            return new UnifiedStore(db, engine, source, null, null, path);
+        } catch (err) {
+            db.close();
+            throw err;
+        }
+    }
+
     /** #4609: mark this instance's file set as verified by a scan that ran IN
      * THIS LIFETIME (sync or background ok) so a clean close refreshes the
      * verdict cache onto the post-checkpoint stats. A boot-time cached ok
@@ -2827,6 +2840,10 @@ export class UnifiedStore {
         if (this.ingestTouchedThisProcess.has(sessionId)) return;
         this.ingestTouchedThisProcess.add(sessionId);
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
+    }
+
+    forgetIngestTrust(sessionId: string): void {
+        this.ingestTouchedThisProcess.delete(sessionId);
     }
 
     /** #3248 lane-ownership probe for the message sweep (#3285): every ext

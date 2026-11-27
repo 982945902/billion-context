@@ -726,7 +726,7 @@ export async function prepareAnthropic(
     // the #3397 orphaned-generation gap that makes a later turn cite refs the
     // gate rejects as "above the highest allocated ref". markDirty below keeps
     // the JSON envelope debounced; this only moves the small row ingest ahead.
-    getStore().ingestRowsNow(session);
+    await getStore().ingestRowsForRequest(session);
     // #5874 P2-final: the in-request snapshot flush above already persisted
     // this revision; re-arm the debounce only if the session mutated since
     // (stats probes land at the next flush) or the flush never landed.
